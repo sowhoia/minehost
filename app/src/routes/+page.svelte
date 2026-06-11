@@ -1,156 +1,234 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-  let name = $state("");
-  let greetMsg = $state("");
+  type Peer = { name: string; rtt_ms: number; path: string };
+  type MhEvent =
+    | { type: "host_ready"; invite_code: string }
+    | { type: "guest_joined"; id: string; name: string }
+    | { type: "guest_left"; id: string }
+    | { type: "joined_host"; local_port: number; world_name: string }
+    | { type: "peer_status"; id: string; rtt_ms: number; path: string }
+    | { type: "disconnected"; reason: string }
+    | { type: "reconnecting"; attempt: number }
+    | { type: "host_minecraft_status"; online: boolean };
 
-  async function greet(event: Event) {
-    event.preventDefault();
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsg = await invoke("greet", { name });
+  let mode = $state<"home" | "host" | "guest">("home");
+  let busy = $state(false);
+  let error = $state("");
+  let inviteCode = $state("");
+  let joinCode = $state("");
+  let playerName = $state("Player");
+  let statusLine = $state("");
+  let worldName = $state("");
+  let copied = $state(false);
+  let peers = $state<Record<string, Peer>>({});
+
+  const pathIcon = (p: string) =>
+    p === "direct" ? "⚡" : p === "relay" ? "🌐" : p === "mixed" ? "⚡🌐" : "·";
+
+  function handleEvent(ev: MhEvent) {
+    switch (ev.type) {
+      case "guest_joined":
+        peers[ev.id] = { name: ev.name, rtt_ms: 0, path: "unknown" };
+        break;
+      case "guest_left":
+        delete peers[ev.id];
+        break;
+      case "peer_status":
+        peers[ev.id] = { name: peers[ev.id]?.name ?? "хост", rtt_ms: ev.rtt_ms, path: ev.path };
+        break;
+      case "joined_host":
+        worldName = ev.world_name;
+        statusLine = `Подключено! Открой Minecraft → Multiplayer: «${ev.world_name}» в LAN-списке`;
+        break;
+      case "disconnected":
+        statusLine = `Связь потеряна: ${ev.reason}`;
+        break;
+      case "reconnecting":
+        statusLine = `Переподключение (попытка ${ev.attempt})…`;
+        break;
+      case "host_minecraft_status":
+        statusLine = ev.online
+          ? `Хост снова в игре! «${worldName}» доступен в LAN-списке`
+          : "Хост офлайн (мир закрыт?) — туннель ждёт его возвращения";
+        break;
+    }
+  }
+
+  $effect(() => {
+    const un: Promise<UnlistenFn> = listen<MhEvent>("mh-event", (e) => handleEvent(e.payload));
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  async function startHost() {
+    busy = true;
+    error = "";
+    try {
+      inviteCode = await invoke<string>("start_host", { manualPort: null });
+      mode = "host";
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function joinHost() {
+    busy = true;
+    error = "";
+    try {
+      const port = await invoke<number>("join", { code: joinCode.trim(), playerName });
+      statusLine = `Туннель готов (127.0.0.1:${port}), устанавливаем связь…`;
+      mode = "guest";
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function stopSession() {
+    await invoke("stop");
+    peers = {};
+    inviteCode = "";
+    statusLine = "";
+    mode = "home";
+  }
+
+  async function copyCode() {
+    await navigator.clipboard.writeText(inviteCode);
+    copied = true;
+    setTimeout(() => (copied = false), 1500);
   }
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main>
+  <h1>⛏ MineHost</h1>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+  {#if error}<p class="error">{error}</p>{/if}
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  {#if mode === "home"}
+    <div class="col">
+      <button class="big" disabled={busy} onclick={startHost}>
+        Хостить мир
+        <small>Сначала открой мир: Esc → Open to LAN</small>
+      </button>
+      <div class="join-box">
+        <input placeholder="Твой ник" bind:value={playerName} />
+        <input placeholder="Код приглашения (mh:…)" bind:value={joinCode} />
+        <button class="big" disabled={busy || !joinCode.trim()} onclick={joinHost}>
+          Подключиться к другу
+        </button>
+      </div>
+      {#if busy}<p class="muted">Подключаемся…</p>{/if}
+    </div>
+  {:else if mode === "host"}
+    <div class="col">
+      <p>Отправь друзьям код приглашения:</p>
+      <code class="invite">{inviteCode}</code>
+      <button onclick={copyCode}>{copied ? "Скопировано ✓" : "Копировать код"}</button>
+      <h2>Игроки</h2>
+      {#if Object.keys(peers).length === 0}
+        <p class="muted">Пока никого — жди друзей</p>
+      {/if}
+      <ul>
+        {#each Object.entries(peers) as [id, p] (id)}
+          <li>{pathIcon(p.path)} {p.name} — {p.rtt_ms} ms</li>
+        {/each}
+      </ul>
+      <button class="danger" onclick={stopSession}>Остановить</button>
+    </div>
+  {:else}
+    <div class="col">
+      <p>{statusLine}</p>
+      {#each Object.entries(peers) as [id, p] (id)}
+        <p>{pathIcon(p.path)} до хоста: {p.rtt_ms} ms ({p.path})</p>
+      {/each}
+      <button class="danger" onclick={stopSession}>Отключиться</button>
+    </div>
+  {/if}
 </main>
 
 <style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+  :global(body) {
+    margin: 0;
+    font-family: system-ui, sans-serif;
+    background: #1a1d23;
+    color: #e8e8e8;
   }
-
-  a:hover {
-    color: #24c8db;
+  main {
+    max-width: 440px;
+    margin: 0 auto;
+    padding: 24px;
   }
-
-  input,
+  h1 {
+    text-align: center;
+  }
+  .col {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
   button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    background: #3a7d44;
+    color: white;
+    font-size: 15px;
+    cursor: pointer;
   }
-  button:active {
-    background-color: #0f0f0f69;
+  button:disabled {
+    opacity: 0.5;
   }
-}
-
+  button.big {
+    padding: 18px;
+    font-size: 17px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: center;
+  }
+  button.big small {
+    opacity: 0.7;
+    font-size: 12px;
+  }
+  button.danger {
+    background: #8d3434;
+  }
+  .join-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 16px;
+  }
+  input {
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #23272f;
+    color: inherit;
+    font-size: 14px;
+  }
+  code.invite {
+    word-break: break-all;
+    background: #23272f;
+    padding: 12px;
+    border-radius: 8px;
+    font-size: 12px;
+    user-select: all;
+  }
+  .error {
+    color: #ff7b7b;
+  }
+  .muted {
+    opacity: 0.6;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+  }
 </style>
