@@ -1,6 +1,7 @@
 //! Адаптер над iroh::Endpoint. Вся специфика версии iroh — здесь.
 use anyhow::Result;
-use iroh::{endpoint::presets, Endpoint, SecretKey};
+use iroh::endpoint::{presets, Connection, PathId, TransportAddrUsage};
+use iroh::{Endpoint, SecretKey};
 
 use crate::ALPN;
 
@@ -19,17 +20,29 @@ pub async fn make_endpoint(secret_key: Option<SecretKey>, relays: bool) -> Resul
     Ok(builder.bind().await?)
 }
 
+/// Текущая оценка RTT соединения в миллисекундах (0 — пока неизвестно).
+pub fn conn_rtt_ms(conn: &Connection) -> u32 {
+    conn.rtt(PathId::ZERO)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(0)
+}
+
 /// Направление пути к пиру: напрямую или через релей.
+/// Смотрим активные транспортные адреса пира из remote_info.
 pub async fn path_kind(ep: &Endpoint, id: iroh::EndpointId) -> crate::events::PathKind {
     use crate::events::PathKind;
-    // remote_info даёт сведения о транспортных адресах недавнего пира.
-    // Если структура полей отличается в текущей iroh — поправить только здесь;
-    // безопасный fallback — Unknown (UI покажет «?»).
     match ep.remote_info(id).await {
         Some(info) => {
-            let dbg = format!("{info:?}").to_lowercase();
-            let direct = dbg.contains("direct") || dbg.contains("udp");
-            let relay = dbg.contains("relay");
+            let (mut direct, mut relay) = (false, false);
+            for a in info.addrs() {
+                if matches!(a.usage(), TransportAddrUsage::Active) {
+                    if a.addr().is_relay() {
+                        relay = true;
+                    } else {
+                        direct = true;
+                    }
+                }
+            }
             match (direct, relay) {
                 (true, false) => PathKind::Direct,
                 (false, true) => PathKind::Relay,
