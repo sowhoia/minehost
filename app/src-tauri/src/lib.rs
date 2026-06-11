@@ -31,8 +31,17 @@ fn load_or_create_key(app: &AppHandle) -> anyhow::Result<iroh::SecretKey> {
 }
 
 fn forward_events(app: AppHandle, mut rx: mpsc::Receiver<mine_host_core::events::Event>) {
+    use tauri_plugin_notification::NotificationExt;
     tauri::async_runtime::spawn(async move {
         while let Some(ev) = rx.recv().await {
+            if let mine_host_core::events::Event::GuestJoined { name, .. } = &ev {
+                let _ = app
+                    .notification()
+                    .builder()
+                    .title("MineHost")
+                    .body(format!("{name} подключился к миру"))
+                    .show();
+            }
             let _ = app.emit("mh-event", &ev);
         }
     });
@@ -112,10 +121,34 @@ async fn stop_inner(state: &State<'_, AppState>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState { session: Mutex::new(None) })
         .invoke_handler(tauri::generate_handler![start_host, join, stop])
+        .setup(|app| {
+            let show = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
