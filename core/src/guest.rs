@@ -213,8 +213,38 @@ async fn serve_conn(
     result
 }
 
-/// Заглушка до Task 9 (UDP для голосовых модов).
-async fn datagram_bridge_guest(_conn: Connection, _local_port: u16) {}
+/// Мост локальный UDP ↔ QUIC-датаграммы. Запоминаем адрес последнего
+/// локального отправителя (голосовой клиент), туда возвращаем ответы.
+async fn datagram_bridge_guest(conn: Connection, local_port: u16) {
+    let Ok(sock) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, local_port)).await else {
+        tracing::warn!("UDP {local_port} занят — голосовые моды не будут работать");
+        return;
+    };
+    let sock = std::sync::Arc::new(sock);
+    let last_src = std::sync::Arc::new(tokio::sync::Mutex::new(None::<std::net::SocketAddr>));
+
+    let recv_sock = sock.clone();
+    let recv_src = last_src.clone();
+    let recv_conn = conn.clone();
+    let to_local = tokio::spawn(async move {
+        while let Ok(dgram) = recv_conn.read_datagram().await {
+            if let Some(addr) = *recv_src.lock().await {
+                let _ = recv_sock.send_to(&dgram, addr).await;
+            }
+        }
+    });
+    let from_local = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+            *last_src.lock().await = Some(src);
+            if conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
+                break;
+            }
+        }
+    });
+    let _ = to_local.await;
+    from_local.abort();
+}
 
 #[cfg(test)]
 mod tests {

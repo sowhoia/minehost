@@ -171,5 +171,30 @@ async fn handle_stream(
     Ok(())
 }
 
-/// Заглушка до Task 9 (UDP для голосовых модов).
-async fn datagram_bridge_host(_conn: Connection, _port: u16) {}
+/// Мост QUIC-датаграммы ↔ локальный UDP (голосовые моды).
+/// На каждое соединение — свой сокет: ответы сервера уходят нужному гостю.
+async fn datagram_bridge_host(conn: Connection, port: u16) {
+    let Ok(sock) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await else { return };
+    if sock.connect((Ipv4Addr::LOCALHOST, port)).await.is_err() {
+        return;
+    }
+    let sock = std::sync::Arc::new(sock);
+
+    let recv_sock = sock.clone();
+    let recv_conn = conn.clone();
+    let to_local = tokio::spawn(async move {
+        while let Ok(dgram) = recv_conn.read_datagram().await {
+            let _ = recv_sock.send(&dgram).await;
+        }
+    });
+    let from_local = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok(n) = sock.recv(&mut buf).await {
+            if conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
+                break;
+            }
+        }
+    });
+    let _ = to_local.await;
+    from_local.abort();
+}
