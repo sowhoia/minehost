@@ -1,6 +1,6 @@
 //! Адаптер над iroh::Endpoint. Вся специфика версии iroh — здесь.
 use anyhow::Result;
-use iroh::endpoint::{presets, Connection, PathId, TransportAddrUsage};
+use iroh::endpoint::{presets, Connection, PathId, QuicTransportConfig, TransportAddrUsage, VarInt};
 use iroh::{Endpoint, SecretKey};
 
 use crate::ALPN;
@@ -14,6 +14,14 @@ pub async fn make_endpoint(secret_key: Option<SecretKey>, relays: bool) -> Resul
         Endpoint::builder(presets::Minimal)
     };
     builder = builder.alpns(vec![ALPN.to_vec()]);
+    // Дефолтные окна noq рассчитаны на 100 Мбит/100 мс. Логин в тяжёлый модпак —
+    // всплеск в десятки МБ по одному потоку; поднимаем окна, чтобы не душить его.
+    let transport = QuicTransportConfig::builder()
+        .stream_receive_window(VarInt::from_u32(16 * 1024 * 1024))
+        .receive_window(VarInt::from_u32(64 * 1024 * 1024))
+        .send_window(64 * 1024 * 1024)
+        .build();
+    builder = builder.transport_config(transport);
     if let Some(key) = secret_key {
         builder = builder.secret_key(key);
     }

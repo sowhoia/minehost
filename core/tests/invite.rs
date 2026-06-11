@@ -1,6 +1,16 @@
 use mine_host_core::invite;
 
 #[tokio::test]
+async fn invite_link_roundtrip() {
+    let ep = mine_host_core::net::make_endpoint(None, false).await.unwrap();
+    let addr = ep.addr();
+    let link = invite::encode_link(&addr);
+    assert!(link.starts_with("minehost://join/mh:"), "got {link}");
+    assert_eq!(invite::decode(&link).unwrap().id, addr.id);
+    ep.close().await;
+}
+
+#[tokio::test]
 async fn invite_code_roundtrip() {
     // Реальный endpoint, чтобы получить валидный EndpointAddr (bind локальный).
     let ep = mine_host_core::net::make_endpoint(None, false).await.unwrap();
