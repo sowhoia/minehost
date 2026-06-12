@@ -1,5 +1,7 @@
 //! Хост-сессия: принимает гостей и проксирует их в локальный Minecraft.
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -23,17 +25,43 @@ pub struct HostOptions {
     pub use_relays: bool,
 }
 
+type ConnMap = Arc<tokio::sync::Mutex<HashMap<String, Connection>>>;
+
 pub struct HostSession {
     pub invite_code: String,
     events: Option<mpsc::Receiver<Event>>,
     endpoint: Endpoint,
     accept_task: tokio::task::JoinHandle<()>,
+    conns: ConnMap,
+    blocked: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl HostSession {
     /// Receiver событий (забирается один раз — для UI).
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.events.take()
+    }
+
+    /// Выгоняет гостя и заносит в блок-лист (до конца сессии).
+    pub async fn kick(&self, id: &str) -> bool {
+        self.blocked.lock().await.insert(id.to_string());
+        match self.conns.lock().await.remove(id) {
+            Some(c) => {
+                c.close(0u32.into(), b"kicked");
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Снимок активных гостей: (id, rtt_ms).
+    pub async fn guests(&self) -> Vec<(String, u32)> {
+        self.conns
+            .lock()
+            .await
+            .iter()
+            .map(|(id, c)| (id.clone(), crate::net::conn_rtt_ms(c)))
+            .collect()
     }
 
     pub async fn close(self) {
@@ -51,17 +79,35 @@ pub async fn start(opts: HostOptions) -> Result<HostSession> {
     let (tx, rx) = mpsc::channel::<Event>(64);
     let _ = tx.try_send(Event::HostReady { invite_code: invite_code.clone() });
 
+    let conns: ConnMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let blocked = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+
     let ep = endpoint.clone();
     let port = opts.port;
     let world_name = opts.world_name.clone();
+    let accept_conns = conns.clone();
+    let accept_blocked = blocked.clone();
     let accept_task = tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
             let Ok(conn) = incoming.await else { continue };
-            tokio::spawn(handle_conn(ep.clone(), conn, port, world_name.clone(), tx.clone()));
+            let id = conn.remote_id().to_string();
+            if accept_blocked.lock().await.contains(&id) {
+                conn.close(0u32.into(), b"blocked");
+                continue;
+            }
+            accept_conns.lock().await.insert(id, conn.clone());
+            tokio::spawn(handle_conn(
+                ep.clone(),
+                conn,
+                port,
+                world_name.clone(),
+                tx.clone(),
+                accept_conns.clone(),
+            ));
         }
     });
 
-    Ok(HostSession { invite_code, events: Some(rx), endpoint, accept_task })
+    Ok(HostSession { invite_code, events: Some(rx), endpoint, accept_task, conns, blocked })
 }
 
 async fn handle_conn(
@@ -70,6 +116,7 @@ async fn handle_conn(
     port: u16,
     world_name: String,
     tx: mpsc::Sender<Event>,
+    conns: ConnMap,
 ) {
     let remote_id = conn.remote_id();
     let id_str = remote_id.to_string();
@@ -114,6 +161,7 @@ async fn handle_conn(
                 });
             }
             Err(_) => {
+                conns.lock().await.remove(&id_str);
                 let _ = tx.send(Event::GuestLeft { id: id_str.clone() }).await;
                 break;
             }
