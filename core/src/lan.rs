@@ -31,10 +31,16 @@ fn discovery_socket() -> io::Result<UdpSocket> {
 
 /// Сокет маяка: шлём мультикаст через loopback, чтобы Minecraft-клиент на этой
 /// машине увидел источник 127.0.0.1 и подключился к локальному прокси.
+/// Настройки мультикаста — best-effort: на некоторых системах (Linux без
+/// MULTICAST-флага на lo) они падают, но отправка всё равно может работать.
 fn beacon_socket() -> io::Result<UdpSocket> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    s.set_multicast_if_v4(&Ipv4Addr::LOCALHOST)?;
-    s.set_multicast_loop_v4(true)?;
+    if let Err(e) = s.set_multicast_if_v4(&Ipv4Addr::LOCALHOST) {
+        tracing::warn!("set_multicast_if_v4(loopback): {e}");
+    }
+    if let Err(e) = s.set_multicast_loop_v4(true) {
+        tracing::warn!("set_multicast_loop_v4: {e}");
+    }
     s.bind(&SocketAddr::from((Ipv4Addr::LOCALHOST, 0)).into())?;
     s.set_nonblocking(true)?;
     UdpSocket::from_std(s.into())

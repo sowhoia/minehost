@@ -133,10 +133,18 @@ async fn serve_conn(
         Some(protocol::CtrlMsg::Info { world_name }) => world_name,
         other => anyhow::bail!("ожидал Info, получил {other:?}"),
     };
-    let _beacon = LanBeacon::start(LanAnnounce {
+    // Маяк — UX-сахар: без него мир не появится в LAN-списке, но туннель
+    // обязан жить (можно подключиться вручную по 127.0.0.1:порт).
+    let _beacon = match LanBeacon::start(LanAnnounce {
         motd: format!("{world_name} ⚡"),
         port: local_port,
-    })?;
+    }) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!("LAN-маяк недоступен: {e:#}");
+            None
+        }
+    };
     let _ = tx
         .send(Event::JoinedHost { local_port, world_name: world_name.clone() })
         .await;
