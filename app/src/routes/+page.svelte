@@ -41,6 +41,7 @@
       case "joined_host":
         worldName = ev.world_name;
         statusLine = `Подключено! Открой Minecraft → Multiplayer: «${ev.world_name}» в LAN-списке`;
+        saveRecent(joinCode.trim(), ev.world_name);
         break;
       case "disconnected":
         statusLine = `Связь потеряна: ${ev.reason}`;
@@ -63,17 +64,29 @@
     };
   });
 
-  async function startHost() {
+  let manualPort = $state("");
+  const portValid = (s: string) => /^\d+$/.test(s) && +s > 0 && +s < 65536;
+
+  async function startHost(port?: number) {
     busy = true;
     error = "";
     try {
-      inviteCode = await invoke<string>("start_host", { manualPort: null });
+      inviteCode = await invoke<string>("start_host", { manualPort: port ?? null });
       mode = "host";
     } catch (e) {
       error = String(e);
     } finally {
       busy = false;
     }
+  }
+
+  type Recent = { code: string; world: string; at: number };
+  let recents = $state<Recent[]>(
+    typeof localStorage === "undefined" ? [] : JSON.parse(localStorage.getItem("mh-recents") ?? "[]"),
+  );
+  function saveRecent(code: string, world: string) {
+    recents = [{ code, world, at: Date.now() }, ...recents.filter((r) => r.code !== code)].slice(0, 5);
+    localStorage.setItem("mh-recents", JSON.stringify(recents));
   }
 
   async function joinHost() {
@@ -103,7 +116,38 @@
     copied = true;
     setTimeout(() => (copied = false), 1500);
   }
+
+  let diagText = $state("");
+  async function refreshDiag() {
+    diagText = JSON.stringify(await invoke("diagnostics"), null, 2);
+  }
+  async function kickPeer(id: string) {
+    await invoke("kick", { id });
+    delete peers[id];
+  }
+  async function rotateCode() {
+    busy = true;
+    error = "";
+    try {
+      await invoke("rotate_code");
+      peers = {};
+      await startHost();
+    } catch (e) {
+      error = String(e);
+      mode = "home";
+    } finally {
+      busy = false;
+    }
+  }
 </script>
+
+{#snippet diagPanel()}
+  <details>
+    <summary>Диагностика</summary>
+    <button class="mini" onclick={refreshDiag}>Обновить</button>
+    <pre class="diag">{diagText || "нажми «Обновить»"}</pre>
+  </details>
+{/snippet}
 
 <main>
   <h1>⛏ MineHost</h1>
@@ -112,10 +156,19 @@
 
   {#if mode === "home"}
     <div class="col">
-      <button class="big" disabled={busy} onclick={startHost}>
+      <button class="big" disabled={busy} onclick={() => startHost()}>
         Хостить мир
         <small>Сначала открой мир: Esc → Open to LAN</small>
       </button>
+      <details>
+        <summary>У меня выделенный сервер</summary>
+        <div class="join-box">
+          <input placeholder="Порт сервера (например 25565)" bind:value={manualPort} />
+          <button disabled={busy || !portValid(manualPort)} onclick={() => startHost(Number(manualPort))}>
+            Хостить сервер на порту {manualPort || "…"}
+          </button>
+        </div>
+      </details>
       <div class="join-box">
         <input placeholder="Твой ник" bind:value={playerName} />
         <input placeholder="Код приглашения (mh:…)" bind:value={joinCode} />
@@ -123,6 +176,21 @@
           Подключиться к другу
         </button>
       </div>
+      {#if recents.length}
+        <h3>Недавние миры</h3>
+        {#each recents as r (r.code)}
+          <button
+            class="recent"
+            disabled={busy}
+            onclick={() => {
+              joinCode = r.code;
+              joinHost();
+            }}
+          >
+            ⟳ {r.world}
+          </button>
+        {/each}
+      {/if}
       {#if busy}<p class="muted">Подключаемся…</p>{/if}
     </div>
   {:else if mode === "host"}
@@ -136,10 +204,15 @@
       {/if}
       <ul>
         {#each Object.entries(peers) as [id, p] (id)}
-          <li>{pathIcon(p.path)} {p.name} — {p.rtt_ms} ms</li>
+          <li>
+            {pathIcon(p.path)} {p.name} — {p.rtt_ms} ms
+            <button class="mini danger" title="Выгнать" onclick={() => kickPeer(id)}>✕</button>
+          </li>
         {/each}
       </ul>
+      <button onclick={rotateCode} disabled={busy}>Новый код приглашения</button>
       <button class="danger" onclick={stopSession}>Остановить</button>
+      {@render diagPanel()}
     </div>
   {:else}
     <div class="col">
@@ -148,6 +221,7 @@
         <p>{pathIcon(p.path)} до хоста: {p.rtt_ms} ms ({p.path})</p>
       {/each}
       <button class="danger" onclick={stopSession}>Отключиться</button>
+      {@render diagPanel()}
     </div>
   {/if}
 </main>
@@ -226,6 +300,32 @@
   }
   .muted {
     opacity: 0.6;
+  }
+  .mini {
+    padding: 2px 8px;
+    font-size: 12px;
+  }
+  .recent {
+    background: #2a4d7a;
+    text-align: left;
+  }
+  details {
+    background: #20242b;
+    border-radius: 8px;
+    padding: 8px 12px;
+  }
+  summary {
+    cursor: pointer;
+    opacity: 0.8;
+  }
+  pre.diag {
+    font-size: 11px;
+    overflow-x: auto;
+    background: #23272f;
+    padding: 8px;
+    border-radius: 8px;
+    white-space: pre-wrap;
+    word-break: break-all;
   }
   ul {
     list-style: none;

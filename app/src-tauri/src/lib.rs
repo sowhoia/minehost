@@ -110,6 +110,33 @@ async fn stop(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+async fn kick(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    match &*state.session.lock().await {
+        Some(Session::Host(h)) => Ok(h.kick(&id).await),
+        _ => Err("нет активной хост-сессии".into()),
+    }
+}
+
+/// Новый код приглашения = новый ключ хоста (старые коды перестают работать).
+/// Фронтенд после этого вызывает start_host заново.
+#[tauri::command]
+async fn rotate_code(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    stop_inner(&state).await;
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::remove_file(dir.join("host.key")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    match &*state.session.lock().await {
+        Some(Session::Host(h)) => Ok(serde_json::to_value(h.diagnostics().await).unwrap()),
+        Some(Session::Guest(g)) => Ok(serde_json::to_value(g.diagnostics().await).unwrap()),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
 async fn stop_inner(state: &State<'_, AppState>) {
     if let Some(session) = state.session.lock().await.take() {
         match session {
@@ -128,7 +155,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { session: Mutex::new(None) })
-        .invoke_handler(tauri::generate_handler![start_host, join, stop])
+        .invoke_handler(tauri::generate_handler![
+            start_host,
+            join,
+            stop,
+            kick,
+            rotate_code,
+            diagnostics
+        ])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
