@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+  import { open } from "@tauri-apps/plugin-dialog";
 
   type Peer = { name: string; rtt_ms: number; path: string };
   type MhEvent =
@@ -97,6 +98,42 @@
     }
   }
 
+  let jarPath = $state("");
+  let ramMb = $state("4096");
+  let eula = $state(false);
+  let serverLog = $state("");
+  let serverRunning = $state(false);
+  $effect(() => {
+    const un = listen<string>("mh-server-log", (e) => (serverLog = e.payload));
+    return () => {
+      un.then((f) => f());
+    };
+  });
+  async function pickJar() {
+    const p = await open({ filters: [{ name: "Server JAR", extensions: ["jar"] }] });
+    if (typeof p === "string") jarPath = p;
+  }
+  async function startServerAndHost() {
+    busy = true;
+    error = "";
+    serverLog = "Запускаю сервер…";
+    try {
+      const port = await invoke<number>("server_start", {
+        jarPath,
+        ramMb: Number(ramMb),
+        acceptEula: eula,
+      });
+      serverRunning = true;
+      await startHost(port);
+    } catch (e) {
+      error = String(e);
+      await invoke("server_stop");
+      serverRunning = false;
+    } finally {
+      busy = false;
+    }
+  }
+
   type Recent = { code: string; world: string; at: number };
   let recents = $state<Recent[]>(
     typeof localStorage === "undefined" ? [] : JSON.parse(localStorage.getItem("mh-recents") ?? "[]"),
@@ -122,6 +159,10 @@
 
   async function stopSession() {
     await invoke("stop");
+    if (serverRunning) {
+      await invoke("server_stop");
+      serverRunning = false;
+    }
     peers = {};
     inviteCode = "";
     statusLine = "";
@@ -184,6 +225,20 @@
           <button disabled={busy || !portValid(manualPort)} onclick={() => startHost(Number(manualPort))}>
             Хостить сервер на порту {manualPort || "…"}
           </button>
+        </div>
+        <div class="join-box">
+          <p class="muted">…или пусть MineHost сам запустит server.jar:</p>
+          <button class="mini" onclick={pickJar}>
+            {jarPath ? jarPath.split(/[\\/]/).pop() : "Выбрать server.jar"}
+          </button>
+          <input placeholder="RAM, МБ (например 6144)" bind:value={ramMb} />
+          <label class="muted">
+            <input type="checkbox" bind:checked={eula} /> Принимаю Minecraft EULA
+          </label>
+          <button disabled={busy || !jarPath || !eula} onclick={startServerAndHost}>
+            Запустить сервер и хостить
+          </button>
+          {#if serverLog}<p class="muted log">{serverLog}</p>{/if}
         </div>
       </details>
       <div class="join-box">
@@ -325,6 +380,13 @@
   .recent {
     background: #2a4d7a;
     text-align: left;
+  }
+  .log {
+    font-family: monospace;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   details {
     background: #20242b;

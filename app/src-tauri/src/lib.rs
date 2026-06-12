@@ -1,3 +1,5 @@
+mod server;
+
 use std::time::Duration;
 
 use mine_host_core::{guest, host, lan};
@@ -129,6 +131,23 @@ async fn rotate_code(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
 }
 
 #[tauri::command]
+async fn server_start(
+    app: AppHandle,
+    srv: State<'_, server::ServerState>,
+    jar_path: String,
+    ram_mb: u32,
+    accept_eula: bool,
+) -> Result<u16, String> {
+    server::start(app, &srv, jar_path, ram_mb, accept_eula).await
+}
+
+#[tauri::command]
+async fn server_stop(srv: State<'_, server::ServerState>) -> Result<(), String> {
+    server::stop(&srv).await;
+    Ok(())
+}
+
+#[tauri::command]
 async fn diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     match &*state.session.lock().await {
         Some(Session::Host(h)) => Ok(serde_json::to_value(h.diagnostics().await).unwrap()),
@@ -164,14 +183,18 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState { session: Mutex::new(None) })
+        .manage(server::ServerState::default())
         .invoke_handler(tauri::generate_handler![
             start_host,
             join,
             stop,
             kick,
             rotate_code,
-            diagnostics
+            diagnostics,
+            server_start,
+            server_stop
         ])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
