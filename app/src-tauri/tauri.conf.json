@@ -22,6 +22,9 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": { "desktop": { "schemes": ["minehost"] } }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

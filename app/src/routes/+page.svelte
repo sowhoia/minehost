@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 
   type Peer = { name: string; rtt_ms: number; path: string };
   type MhEvent =
@@ -64,6 +65,22 @@
     };
   });
 
+  function tryJoinFromLink(s: string) {
+    if (s.startsWith("minehost://") && mode === "home" && !busy) {
+      joinCode = s;
+      joinHost();
+    }
+  }
+  $effect(() => {
+    onOpenUrl((urls) => urls.forEach(tryJoinFromLink));
+    const un = listen<string[]>("mh-deeplink", (e) => e.payload.forEach(tryJoinFromLink));
+    return () => {
+      un.then((f) => f());
+    };
+  });
+
+  const inviteLink = $derived(inviteCode ? `minehost://join/${inviteCode}` : "");
+
   let manualPort = $state("");
   const portValid = (s: string) => /^\d+$/.test(s) && +s > 0 && +s < 65536;
 
@@ -112,7 +129,7 @@
   }
 
   async function copyCode() {
-    await navigator.clipboard.writeText(inviteCode);
+    await navigator.clipboard.writeText(inviteLink);
     copied = true;
     setTimeout(() => (copied = false), 1500);
   }
@@ -195,9 +212,9 @@
     </div>
   {:else if mode === "host"}
     <div class="col">
-      <p>Отправь друзьям код приглашения:</p>
-      <code class="invite">{inviteCode}</code>
-      <button onclick={copyCode}>{copied ? "Скопировано ✓" : "Копировать код"}</button>
+      <p>Отправь друзьям ссылку-приглашение:</p>
+      <code class="invite">{inviteLink}</code>
+      <button onclick={copyCode}>{copied ? "Скопировано ✓" : "Копировать ссылку"}</button>
       <h2>Игроки</h2>
       {#if Object.keys(peers).length === 0}
         <p class="muted">Пока никого — жди друзей</p>

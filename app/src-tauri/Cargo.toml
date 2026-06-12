@@ -28,4 +28,6 @@ anyhow = "1"
 iroh = "0.98"
 hex = "0.4"
 tauri-plugin-notification = "2.3.3"
+tauri-plugin-deep-link = "2.4.9"
+tauri-plugin-single-instance = "2.4.2"
 

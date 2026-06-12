@@ -152,6 +152,16 @@ pub fn run() {
     use tauri::tray::TrayIconBuilder;
 
     tauri::Builder::default()
+        // single-instance должен регистрироваться первым: вторая копия,
+        // запущенная кликом по minehost://-ссылке, пробрасывает argv сюда.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            let _ = app.emit("mh-deeplink", argv);
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppState { session: Mutex::new(None) })
