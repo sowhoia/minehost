@@ -23,7 +23,11 @@
     }
   },
   "plugins": {
-    "deep-link": { "desktop": { "schemes": ["minehost"] } }
+    "deep-link": { "desktop": { "schemes": ["minehost"] } },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM1MkEzQUJBMDc4MTVFODEKUldTQlhvRUh1am9xeGNBYkFEOUlXQjZ5VnJSL0VEdERrNzJEdU1rSllNcnpabUFWU0lBOUdwYjgK",
+      "endpoints": ["https://github.com/OWNER/mine-host/releases/latest/download/latest.json"]
+    }
   },
   "bundle": {
     "active": true,

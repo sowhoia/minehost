@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { check } from "@tauri-apps/plugin-updater";
 
   type Peer = { name: string; rtt_ms: number; path: string };
   type MhEvent =
@@ -179,6 +180,22 @@
   async function refreshDiag() {
     diagText = JSON.stringify(await invoke("diagnostics"), null, 2);
   }
+  let updateMsg = $state("");
+  async function checkUpdate() {
+    updateMsg = "Проверяю…";
+    try {
+      const u = await check();
+      if (u) {
+        updateMsg = `Доступна ${u.version}, скачиваю…`;
+        await u.downloadAndInstall();
+        updateMsg = "Установлено — перезапусти приложение";
+      } else {
+        updateMsg = "У тебя последняя версия";
+      }
+    } catch (e) {
+      updateMsg = `Проверка недоступна: ${e}`;
+    }
+  }
   async function kickPeer(id: string) {
     await invoke("kick", { id });
     delete peers[id];
@@ -203,6 +220,8 @@
   <details>
     <summary>Диагностика</summary>
     <button class="mini" onclick={refreshDiag}>Обновить</button>
+    <button class="mini" onclick={checkUpdate}>Проверить обновления</button>
+    {#if updateMsg}<p class="muted">{updateMsg}</p>{/if}
     <pre class="diag">{diagText || "нажми «Обновить»"}</pre>
   </details>
 {/snippet}
