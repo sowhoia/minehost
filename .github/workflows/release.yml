@@ -34,3 +34,61 @@ jobs:
           releaseName: "MineHost ${{ github.ref_name }}"
           releaseDraft: true
           includeUpdaterJson: true
+
+  # дописывает платформу (windows/macos/linux) в имена файлов релиза,
+  # чтобы было понятно, что качать, и правит ссылки в latest.json
+  platform-names:
+    needs: build
+    permissions: { contents: write }
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rename assets and patch latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          rel_id=$(gh api "repos/$REPO/releases" --paginate \
+            --jq ".[] | select(.tag_name==\"$TAG\") | .id" | head -n1)
+          test -n "$rel_id"
+          gh api "repos/$REPO/releases/$rel_id/assets" --paginate \
+            --jq '.[] | [.id, .name] | @tsv' > assets.tsv
+          : > renames.tsv
+          while IFS=$'\t' read -r id name; do
+            base="$name" sig=""
+            case "$base" in *.sig) sig=".sig" base="${base%.sig}" ;; esac
+            case "$base" in
+              *.msi|*.exe|*.nsis.zip|*.msi.zip) plat="windows" ;;
+              *.dmg|*.app.tar.gz)               plat="macos"   ;;
+              *.AppImage|*.deb|*.rpm)           plat="linux"   ;;
+              *) continue ;;
+            esac
+            case "$base" in *windows*|*macos*|*linux*) continue ;; esac
+            case "$base" in
+              MineHost*) new="MineHost_${plat}${base#MineHost}${sig}" ;;
+              *)         new="${plat}_${base}${sig}" ;;
+            esac
+            gh api -X PATCH "repos/$REPO/releases/assets/$id" -f name="$new" --silent
+            printf '%s\t%s\n' "$name" "$new" >> renames.tsv
+            echo "renamed: $name -> $new"
+          done < assets.tsv
+          lat_id=$(gh api "repos/$REPO/releases/$rel_id/assets" --paginate \
+            --jq '.[] | select(.name=="latest.json") | .id' | head -n1)
+          if [ -n "$lat_id" ] && [ -s renames.tsv ]; then
+            gh api -H "Accept: application/octet-stream" \
+              "repos/$REPO/releases/assets/$lat_id" > latest.json
+            python3 - <<'PY'
+          rows = [l.rstrip("\n").split("\t") for l in open("renames.tsv") if l.strip()]
+          rows.sort(key=lambda r: -len(r[0]))
+          data = open("latest.json", encoding="utf-8").read()
+          for old, new in rows:
+              data = data.replace(old, new)
+          open("latest.json", "w", encoding="utf-8").write(data)
+          PY
+            gh api -X DELETE "repos/$REPO/releases/assets/$lat_id" --silent
+            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" --data-binary @latest.json \
+              "https://uploads.github.com/repos/$REPO/releases/$rel_id/assets?name=latest.json" > /dev/null
+            echo "latest.json patched"
+          fi

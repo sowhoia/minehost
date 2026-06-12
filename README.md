@@ -7,8 +7,8 @@
 
 ## Как играть
 
-**Хост:** открой мир → Esc → *Open to LAN* → в MineHost нажми **Хостить мир** →
-отправь код друзьям.
+**Хост:** открой мир → Esc → *Open to LAN* → в MineHost нажми **Запустить хост** →
+отправь ссылку друзьям.
 
 **Друг:** вставь код → **Подключиться** → открой Minecraft → *Multiplayer* —
 мир уже в LAN-списке. Никаких IP и настроек.
@@ -28,6 +28,16 @@
 - **Диагностика**: rtt, путь (напрямую/релей), адреса — для разборов «почему 🌐».
 - QUIC-окна подняты под логин-всплески тяжёлых модпаков (16/64 МБ).
 
+## Скачать
+
+Бери установщик под свою ОС со страницы
+[Releases](https://github.com/sowhoia/minehost/releases) — платформа указана
+прямо в имени файла:
+
+- `MineHost_windows_…-setup.exe` — Windows;
+- `MineHost_macos_….dmg` — macOS;
+- `MineHost_linux_….AppImage` / `.deb` / `.rpm` — Linux.
+
 ## Сборка
 
 ```bash
@@ -44,22 +54,22 @@ CLI без GUI (для отладки): `cargo run -p mine-host-core --example h
 
 - `core/` — Rust: Iroh QUIC-туннель (TCP-потоки + UDP-датаграммы для голоса),
   LAN-обнаружение/маяк, инвайт-коды `mh:…`, события для UI.
-- `app/` — Tauri 2 + SvelteKit GUI: экраны «Хостить»/«Подключиться»,
-  трей, уведомления.
-
-Спека: `docs/superpowers/specs/2026-06-10-mine-host-design.md`.
-Планы: `docs/superpowers/plans/`.
+- `app/` — Tauri 2 + SvelteKit GUI: вкладки «Хостинг» / «Подключение» /
+  «Игроки» / «Диагностика», трей, уведомления.
 
 ## Релизы и автообновления
 
 CI (`.github/workflows/`) гоняет тесты на трёх ОС; тег `v*` собирает
 установщики Win/macOS/Linux через tauri-action в draft-релиз GitHub
 вместе с `latest.json` для автообновлений (кнопка «Проверить обновления»
-в панели диагностики).
+во вкладке «Диагностика»). После сборки джоб `platform-names` дописывает
+платформу (`windows`/`macos`/`linux`) в имена файлов и правит ссылки
+в `latest.json`.
 
 Выпуск новой версии:
 
-1. Подними `version` в `app/src-tauri/tauri.conf.json`.
+1. Подними `version` в `app/src-tauri/tauri.conf.json`
+   (и в `app/src-tauri/Cargo.toml`).
 2. `git tag vX.Y.Z && git push --tags`.
 3. Опубликуй draft-релиз на GitHub.
 

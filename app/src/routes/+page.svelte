@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getVersion } from "@tauri-apps/api/app";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
   import { open } from "@tauri-apps/plugin-dialog";
@@ -27,8 +28,108 @@
   let copied = $state(false);
   let peers = $state<Record<string, Peer>>({});
 
-  const pathIcon = (p: string) =>
-    p === "direct" ? "⚡" : p === "relay" ? "🌐" : p === "mixed" ? "⚡🌐" : "·";
+  type Tab = "host" | "join" | "players" | "diag";
+  let tab = $state<Tab>("host");
+  let hostSource = $state<"lan" | "port" | "jar">("lan");
+  let elapsed = $state(0);
+  let appVersion = $state("");
+
+  $effect(() => {
+    getVersion().then((v) => (appVersion = v)).catch(() => {});
+  });
+
+  $effect(() => {
+    if (mode === "home") {
+      elapsed = 0;
+      return;
+    }
+    const t = setInterval(() => (elapsed += 1), 1000);
+    return () => clearInterval(t);
+  });
+
+  const phase = $derived(busy ? "connecting" : mode === "home" ? "idle" : "online");
+  const peerCount = $derived(Object.keys(peers).length);
+  const statusColor = $derived(
+    phase === "online" ? "#5fbf4f" : phase === "connecting" ? "#f3c63a" : "#d6504a",
+  );
+  const statusGlow = $derived(
+    phase === "online"
+      ? "rgba(95,191,79,.6)"
+      : phase === "connecting"
+        ? "rgba(243,198,58,.5)"
+        : "rgba(214,80,74,.5)",
+  );
+  const statusShort = $derived(
+    phase === "online" ? "ОНЛАЙН" : phase === "connecting" ? ". . ." : "ОФФЛАЙН",
+  );
+  const statusLabel = $derived(
+    phase === "online"
+      ? mode === "host"
+        ? "Онлайн — хост запущен"
+        : "Онлайн — ты в мире друга"
+      : phase === "connecting"
+        ? "Подключение к P2P-сети…"
+        : "Оффлайн",
+  );
+  const tunnelTxt = $derived(
+    phase === "online" ? "установлен" : phase === "connecting" ? "установка…" : "—",
+  );
+  const uptime = $derived.by(() => {
+    if (mode === "home") return "—";
+    const h = Math.floor(elapsed / 3600);
+    const mm = String(Math.floor((elapsed % 3600) / 60)).padStart(2, "0");
+    const ss = String(elapsed % 60).padStart(2, "0");
+    return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  });
+  const footerStatus = $derived(
+    phase === "connecting"
+      ? "подключение…"
+      : mode === "host"
+        ? "хост запущен"
+        : mode === "guest"
+          ? "подключён к миру"
+          : "хост остановлен",
+  );
+
+  const SKINS = [
+    { skin: "#a06a44", hair: "#3a2a1a", eye: "#6b4a8f" },
+    { skin: "#f0c8a0", hair: "#d2792f", eye: "#4a8f6b" },
+    { skin: "#54a04a", hair: "#3a6e33", eye: "#143010" },
+    { skin: "#2c2436", hair: "#7d3fb0", eye: "#c060ff" },
+    { skin: "#c98e5e", hair: "#1a1a1a", eye: "#3fd0d0" },
+    { skin: "#d99a7a", hair: "#9a4f2a", eye: "#5a3a20" },
+  ];
+  const BIOMES = [
+    { sky: "#3b6ea5", skyTop: "#6fa8d8", grass: "#5fa84e", grassHi: "#7ec85f", dirt: "#7a5230", sun: "#fff2b0" },
+    { sky: "#2a1a3a", skyTop: "#4a2f63", grass: "#7d3fb0", grassHi: "#a05fd0", dirt: "#3a2150", sun: "#d6a0ff" },
+    { sky: "#5a1e14", skyTop: "#8a2e1c", grass: "#c0431f", grassHi: "#e0612f", dirt: "#5a1e14", sun: "#ffb070" },
+    { sky: "#7fb0d8", skyTop: "#b8d8ec", grass: "#e8f0f5", grassHi: "#ffffff", dirt: "#8a8f99", sun: "#fffae0" },
+  ];
+  function hashStr(s: string) {
+    let h = 0;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+    return Math.abs(h);
+  }
+  const skinFor = (name: string) => SKINS[hashStr(name) % SKINS.length];
+  const biomeFor = (code: string) => BIOMES[hashStr(code) % BIOMES.length];
+
+  function pingView(rtt: number) {
+    if (!rtt) return { level: 0, col: "#8a8a8a", txt: "…" };
+    const level = rtt < 55 ? 4 : rtt < 110 ? 3 : rtt < 185 ? 2 : 1;
+    const col = rtt < 110 ? "#5fbf4f" : rtt < 185 ? "#f3c63a" : "#d6504a";
+    return { level, col, txt: `${rtt} ms` };
+  }
+  const pathLabel = (p: string) =>
+    p === "direct" ? "⚡ напрямую" : p === "relay" ? "🌐 через релей" : p === "mixed" ? "⚡🌐 смешанный" : "путь ищется…";
+
+  function ago(at: number) {
+    const s = Math.floor((Date.now() - at) / 1000);
+    if (s < 90) return "только что";
+    if (s < 3600) return `${Math.floor(s / 60)} мин назад`;
+    if (s < 86400) return `${Math.floor(s / 3600)} ч назад`;
+    const d = Math.floor(s / 86400);
+    return d === 1 ? "вчера" : `${d} дн назад`;
+  }
 
   function handleEvent(ev: MhEvent) {
     switch (ev.type) {
@@ -70,6 +171,7 @@
   function tryJoinFromLink(s: string) {
     if (s.startsWith("minehost://") && mode === "home" && !busy) {
       joinCode = s;
+      tab = "join";
       joinHost();
     }
   }
@@ -133,6 +235,19 @@
     } finally {
       busy = false;
     }
+  }
+
+  const canStart = $derived(
+    hostSource === "lan"
+      ? true
+      : hostSource === "port"
+        ? portValid(manualPort)
+        : !!jarPath && eula,
+  );
+  function startFromSource() {
+    if (hostSource === "lan") startHost();
+    else if (hostSource === "port") startHost(Number(manualPort));
+    else startServerAndHost();
   }
 
   type Recent = { code: string; world: string; at: number };
@@ -216,217 +331,1393 @@
   }
 </script>
 
-{#snippet diagPanel()}
-  <details>
-    <summary>Диагностика</summary>
-    <button class="mini" onclick={refreshDiag}>Обновить</button>
-    <button class="mini" onclick={checkUpdate}>Проверить обновления</button>
-    {#if updateMsg}<p class="muted">{updateMsg}</p>{/if}
-    <pre class="diag">{diagText || "нажми «Обновить»"}</pre>
-  </details>
-{/snippet}
-
-<main>
-  <h1>⛏ MineHost</h1>
-
-  {#if error}<p class="error">{error}</p>{/if}
-
-  {#if mode === "home"}
-    <div class="col">
-      <button class="big" disabled={busy} onclick={() => startHost()}>
-        Хостить мир
-        <small>Сначала открой мир: Esc → Open to LAN</small>
-      </button>
-      <details>
-        <summary>У меня выделенный сервер</summary>
-        <div class="join-box">
-          <input placeholder="Порт сервера (например 25565)" bind:value={manualPort} />
-          <button disabled={busy || !portValid(manualPort)} onclick={() => startHost(Number(manualPort))}>
-            Хостить сервер на порту {manualPort || "…"}
-          </button>
-        </div>
-        <div class="join-box">
-          <p class="muted">…или пусть MineHost сам запустит server.jar:</p>
-          <button class="mini" onclick={pickJar}>
-            {jarPath ? jarPath.split(/[\\/]/).pop() : "Выбрать server.jar"}
-          </button>
-          <input placeholder="RAM, МБ (например 6144)" bind:value={ramMb} />
-          <label class="muted">
-            <input type="checkbox" bind:checked={eula} /> Принимаю Minecraft EULA
-          </label>
-          <button disabled={busy || !jarPath || !eula} onclick={startServerAndHost}>
-            Запустить сервер и хостить
-          </button>
-          {#if serverLog}<p class="muted log">{serverLog}</p>{/if}
-        </div>
-      </details>
-      <div class="join-box">
-        <input placeholder="Твой ник" bind:value={playerName} />
-        <input placeholder="Код приглашения (mh:…)" bind:value={joinCode} />
-        <button class="big" disabled={busy || !joinCode.trim()} onclick={joinHost}>
-          Подключиться к другу
-        </button>
+<div class="page">
+  <div class="shell">
+    <!-- ===== HEADER ===== -->
+    <header class="header">
+      <div class="logo">
+        <div class="logo-grass"></div>
+        <div class="logo-dirt"></div>
       </div>
-      {#if recents.length}
-        <h3>Недавние миры</h3>
-        {#each recents as r (r.code)}
-          <button
-            class="recent"
-            disabled={busy}
-            onclick={() => {
-              joinCode = r.code;
-              joinHost();
-            }}
-          >
-            ⟳ {r.world}
-          </button>
-        {/each}
+      <div class="title-wrap">
+        <div class="app-title">MineHost</div>
+        <div class="app-sub">P2P-хостинг миров · прямое подключение без сервера</div>
+      </div>
+      <div class="status-chip">
+        <div
+          class="chip-dot"
+          class:blink={phase === "connecting"}
+          style:background={statusColor}
+          style:box-shadow="inset 1px 1px 0 rgba(255,255,255,.5), inset -1px -1px 0 rgba(0,0,0,.4), 0 0 8px {statusGlow}"
+        ></div>
+        <span style:color={statusColor}>{statusShort}</span>
+      </div>
+    </header>
+
+    <!-- ===== NAV ===== -->
+    <nav class="nav">
+      <button class="nav-btn" class:active={tab === "host"} onclick={() => (tab = "host")}>
+        Хостинг
+        <span class="nav-bar"></span>
+      </button>
+      <button class="nav-btn" class:active={tab === "join"} onclick={() => (tab = "join")}>
+        Подключение
+        <span class="nav-bar"></span>
+      </button>
+      <button class="nav-btn" class:active={tab === "players"} onclick={() => (tab = "players")}>
+        Игроки
+        <span class="badge" class:on={peerCount > 0}>{peerCount}</span>
+        <span class="nav-bar"></span>
+      </button>
+      <button class="nav-btn" class:active={tab === "diag"} onclick={() => (tab = "diag")}>
+        Диагностика
+        <span class="nav-bar"></span>
+      </button>
+    </nav>
+
+    <!-- ===== CONTENT ===== -->
+    <div class="content">
+      {#if error}
+        <div class="error-banner">
+          <span class="eb-text">⚠ {error}</span>
+          <button class="eb-x" onclick={() => (error = "")}>✕</button>
+        </div>
       {/if}
-      {#if busy}<p class="muted">Подключаемся…</p>{/if}
-    </div>
-  {:else if mode === "host"}
-    <div class="col">
-      <p>Отправь друзьям ссылку-приглашение:</p>
-      <code class="invite">{inviteLink}</code>
-      <button onclick={copyCode}>{copied ? "Скопировано ✓" : "Копировать ссылку"}</button>
-      <h2>Игроки</h2>
-      {#if Object.keys(peers).length === 0}
-        <p class="muted">Пока никого — жди друзей</p>
+
+      <!-- ====== TAB: HOST ====== -->
+      {#if tab === "host"}
+        {#if mode === "guest"}
+          <div class="empty-block">
+            <div class="empty-icon pulse">🧭</div>
+            <div class="empty-title">Ты подключён к чужому миру</div>
+            <div class="empty-sub">Чтобы хостить свой мир, сначала отключись от текущего.</div>
+            <button class="btn-px green" onclick={() => (tab = "join")}>К подключению →</button>
+          </div>
+        {:else}
+          <div class="host-grid">
+            <!-- left: source + host control -->
+            <div>
+              <div class="label green">ИСТОЧНИК МИРА</div>
+              <div class="seg3">
+                <button
+                  class="seg"
+                  class:on={hostSource === "lan"}
+                  disabled={mode !== "home" || busy}
+                  onclick={() => (hostSource = "lan")}>LAN-мир</button
+                >
+                <button
+                  class="seg"
+                  class:on={hostSource === "port"}
+                  disabled={mode !== "home" || busy}
+                  onclick={() => (hostSource = "port")}>Свой порт</button
+                >
+                <button
+                  class="seg"
+                  class:on={hostSource === "jar"}
+                  disabled={mode !== "home" || busy}
+                  onclick={() => (hostSource = "jar")}>server.jar</button
+                >
+              </div>
+
+              <div class="panel src-panel">
+                {#if hostSource === "lan"}
+                  <p class="hint-text">
+                    Открой мир в игре: <b>Esc → Open to LAN</b>. MineHost сам найдёт его и проведёт
+                    друзей напрямую к тебе.
+                  </p>
+                {:else if hostSource === "port"}
+                  <div class="field-label">Порт запущенного сервера</div>
+                  <input
+                    class="px-input"
+                    placeholder="25565"
+                    bind:value={manualPort}
+                    disabled={mode !== "home" || busy}
+                  />
+                {:else}
+                  <button class="btn-px dark file-btn" disabled={mode !== "home" || busy} onclick={pickJar}>
+                    {jarPath ? jarPath.split(/[\\/]/).pop() : "📦 Выбрать server.jar"}
+                  </button>
+                  <div class="field-label">RAM, МБ</div>
+                  <input class="px-input" placeholder="4096" bind:value={ramMb} disabled={mode !== "home" || busy} />
+                  <button class="toggle-row" disabled={mode !== "home" || busy} onclick={() => (eula = !eula)}>
+                    <span class="toggle-label">Принимаю Minecraft EULA</span>
+                    <span class="track" class:on={eula}><span class="knob"></span></span>
+                  </button>
+                  {#if serverLog}<div class="server-log">{serverLog}</div>{/if}
+                {/if}
+              </div>
+
+              {#if phase === "connecting"}
+                <button class="host-toggle yellow" disabled>
+                  <span class="glyph spin">◌</span>
+                  <span class="t-label">Подключение…</span>
+                  <span class="t-hint">Устанавливаем P2P-туннель…</span>
+                </button>
+              {:else if mode === "host"}
+                <button class="host-toggle red" onclick={stopSession}>
+                  <span class="glyph">■</span>
+                  <span class="t-label">Остановить хост</span>
+                  <span class="t-hint">Хост активен — друзья могут заходить</span>
+                </button>
+              {:else}
+                <button class="host-toggle green" disabled={!canStart} onclick={startFromSource}>
+                  <span class="glyph">▶</span>
+                  <span class="t-label">Запустить хост</span>
+                  <span class="t-hint">Запусти, чтобы открыть мир для друзей</span>
+                </button>
+              {/if}
+            </div>
+
+            <!-- right: status + invite -->
+            <div>
+              <div class="label green">СТАТУС СОЕДИНЕНИЯ</div>
+              <div class="panel status-panel">
+                <div class="status-head">
+                  <div
+                    class="status-dot"
+                    class:blink={phase === "connecting"}
+                    style:background={statusColor}
+                    style:box-shadow="inset 2px 2px 0 rgba(255,255,255,.45), inset -2px -2px 0 rgba(0,0,0,.4), 0 0 10px {statusGlow}"
+                  ></div>
+                  <span class="status-label" style:color={statusColor}>{statusLabel}</span>
+                </div>
+                <div class="srow">
+                  <span class="sk">P2P-туннель</span>
+                  <span class="sv" style:color={statusColor}>{tunnelTxt}</span>
+                </div>
+                <div class="srow">
+                  <span class="sk">Время работы</span>
+                  <span class="sv">{uptime}</span>
+                </div>
+                <div class="srow">
+                  <span class="sk">Игроков онлайн</span>
+                  <span class="sv">{peerCount}</span>
+                </div>
+              </div>
+
+              <div class="label yellow">ССЫЛКА-ПРИГЛАШЕНИЕ</div>
+              {#if mode === "host" && inviteLink}
+                <div class="invite-row">
+                  <div class="invite-box">{inviteLink}</div>
+                  <button class="btn-px copy-btn" class:green={copied} class:yellow={!copied} onclick={copyCode}>
+                    {copied ? "✓ скопировано" : "Скопировать"}
+                  </button>
+                </div>
+                <div class="hint-text">
+                  Отправь её друзьям — они подключатся напрямую к твоему ПК. Ссылка живёт, пока
+                  запущен хост.
+                </div>
+                <button class="btn-px dark rotate-btn" disabled={busy} onclick={rotateCode}
+                  >⟳ Новый код приглашения</button
+                >
+                <div class="hint-text dim">Старые ссылки перестанут работать, игроки будут отключены.</div>
+              {:else}
+                <div class="dashed-box">— запусти хост, чтобы получить ссылку —</div>
+              {/if}
+            </div>
+          </div>
+        {/if}
       {/if}
-      <ul>
-        {#each Object.entries(peers) as [id, p] (id)}
-          <li>
-            {pathIcon(p.path)} {p.name} — {p.rtt_ms} ms
-            <button class="mini danger" title="Выгнать" onclick={() => kickPeer(id)}>✕</button>
-          </li>
-        {/each}
-      </ul>
-      <button onclick={rotateCode} disabled={busy}>Новый код приглашения</button>
-      <button class="danger" onclick={stopSession}>Остановить</button>
-      {@render diagPanel()}
+
+      <!-- ====== TAB: JOIN ====== -->
+      {#if tab === "join"}
+        {#if mode === "guest"}
+          <div class="join-session">
+            <div class="label green">ТЕКУЩЕЕ ПОДКЛЮЧЕНИЕ</div>
+            <h2 class="h-px">{worldName || "Мир друга"}</h2>
+            {#if statusLine}<p class="hint-text">{statusLine}</p>{/if}
+            <div class="players-list">
+              {#each Object.entries(peers) as [id, p] (id)}
+                {@const sk = skinFor(p.name)}
+                {@const pv = pingView(p.rtt_ms)}
+                <div class="player-row">
+                  <div class="p-head" style:background={sk.skin}>
+                    <span class="ph-hair" style:background={sk.hair}></span>
+                    <span class="ph-eye l"></span>
+                    <span class="ph-pupil l" style:box-shadow="inset -3px 0 0 {sk.eye}"></span>
+                    <span class="ph-eye r"></span>
+                    <span class="ph-pupil r" style:box-shadow="inset 3px 0 0 {sk.eye}"></span>
+                    <span class="ph-mouth"></span>
+                  </div>
+                  <div class="p-info">
+                    <div class="p-name">{p.name}</div>
+                    <div class="p-status">
+                      <span class="p-dot"></span>
+                      <span>хост · {pathLabel(p.path)}</span>
+                    </div>
+                  </div>
+                  <div class="sig">
+                    {#each [1, 2, 3, 4] as n (n)}
+                      <span
+                        class="bar"
+                        style:height="{4 + n * 5}px"
+                        style:background={n <= pv.level ? pv.col : "#3a3a3a"}
+                      ></span>
+                    {/each}
+                  </div>
+                  <div class="ping" style:color={pv.col}>{pv.txt}</div>
+                </div>
+              {/each}
+            </div>
+            <button class="btn-px red wide" onclick={stopSession}>■ Отключиться</button>
+          </div>
+        {:else}
+          <div class="join-head">
+            <div class="label green">ПОДКЛЮЧИТЬСЯ К ДРУГУ</div>
+            <h2 class="h-px">Вставь код приглашения</h2>
+          </div>
+          <div class="panel join-form">
+            <div class="jf-grid">
+              <div>
+                <div class="field-label">Твой ник</div>
+                <input class="px-input" placeholder="Player" bind:value={playerName} disabled={busy} />
+              </div>
+              <div>
+                <div class="field-label">Код приглашения</div>
+                <input
+                  class="px-input"
+                  placeholder="mh:… или minehost://join/…"
+                  bind:value={joinCode}
+                  disabled={busy}
+                />
+              </div>
+            </div>
+            <button class="btn-px green wide tall" disabled={busy || !joinCode.trim()} onclick={joinHost}>
+              {busy ? "Подключение…" : "▶ Подключиться"}
+            </button>
+          </div>
+
+          {#if recents.length}
+            <div class="label yellow recents-label">НЕДАВНИЕ МИРЫ</div>
+            <div class="worlds-grid">
+              {#each recents as r (r.code)}
+                {@const b = biomeFor(r.code)}
+                <button
+                  class="world-card"
+                  disabled={busy}
+                  onclick={() => {
+                    joinCode = r.code;
+                    joinHost();
+                  }}
+                >
+                  <div class="wc-preview" style:background="linear-gradient(180deg, {b.skyTop}, {b.sky})">
+                    <span class="wc-sun" style:background={b.sun} style:box-shadow="inset 2px 2px 0 rgba(255,255,255,.4), 0 0 12px {b.sun}"></span>
+                    <span class="wc-cloud c1"></span>
+                    <span class="wc-cloud c2"></span>
+                    <span
+                      class="wc-ground"
+                      style:background={b.dirt}
+                      style:box-shadow="inset 0 7px 0 {b.grass}, inset 0 11px 0 {b.grassHi}"
+                    ></span>
+                    <span class="wc-tex"></span>
+                  </div>
+                  <div class="wc-body">
+                    <div class="wc-name">{r.world}</div>
+                    <div class="wc-meta">
+                      <span>⟳ {ago(r.at)}</span>
+                      <span class="wc-pick">⛏</span>
+                    </div>
+                  </div>
+                  <div class="wc-footer">▶ Подключиться →</div>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        {/if}
+      {/if}
+
+      <!-- ====== TAB: PLAYERS ====== -->
+      {#if tab === "players"}
+        <div class="players-head">
+          <div>
+            <div class="label green">
+              {mode === "guest" ? "ТВОЁ ПОДКЛЮЧЕНИЕ" : "ПОДКЛЮЧЁННЫЕ ИГРОКИ"}
+            </div>
+            <h2 class="h-px">{mode === "guest" ? worldName || "Мир друга" : "Твой мир"}</h2>
+          </div>
+          <div class="players-count">
+            <div class="pc-num" style:color={statusColor}>{peerCount}</div>
+            <div class="pc-sub">в сети</div>
+          </div>
+        </div>
+
+        {#if mode === "home"}
+          <div class="empty-block">
+            <div class="off-dot"></div>
+            <div class="empty-title">Хост не запущен</div>
+            <button class="btn-px green" onclick={() => (tab = "host")}>К запуску хоста →</button>
+          </div>
+        {:else if peerCount === 0}
+          <div class="empty-block">
+            <div class="empty-icon pulse">⛏</div>
+            <div class="empty-title">Ожидание подключений…</div>
+            <div class="empty-sub">
+              {mode === "host"
+                ? "Хост запущен. Отправь ссылку-приглашение друзьям."
+                : "Туннель готов — ждём данные от хоста."}
+            </div>
+          </div>
+        {:else}
+          <div class="players-list">
+            {#each Object.entries(peers) as [id, p] (id)}
+              {@const sk = skinFor(p.name)}
+              {@const pv = pingView(p.rtt_ms)}
+              <div class="player-row joined">
+                <div class="p-head" style:background={sk.skin}>
+                  <span class="ph-hair" style:background={sk.hair}></span>
+                  <span class="ph-eye l"></span>
+                  <span class="ph-pupil l" style:box-shadow="inset -3px 0 0 {sk.eye}"></span>
+                  <span class="ph-eye r"></span>
+                  <span class="ph-pupil r" style:box-shadow="inset 3px 0 0 {sk.eye}"></span>
+                  <span class="ph-mouth"></span>
+                </div>
+                <div class="p-info">
+                  <div class="p-name">{p.name}</div>
+                  <div class="p-status">
+                    <span class="p-dot"></span>
+                    <span>{mode === "guest" ? "хост" : "подключён"} · {pathLabel(p.path)}</span>
+                  </div>
+                </div>
+                <div class="sig">
+                  {#each [1, 2, 3, 4] as n (n)}
+                    <span
+                      class="bar"
+                      style:height="{4 + n * 5}px"
+                      style:background={n <= pv.level ? pv.col : "#3a3a3a"}
+                    ></span>
+                  {/each}
+                </div>
+                <div class="ping" style:color={pv.col}>{pv.txt}</div>
+                {#if mode === "host"}
+                  <button class="kick-btn" title="Выгнать до конца сессии" onclick={() => kickPeer(id)}>КИК</button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+
+      <!-- ====== TAB: DIAG ====== -->
+      {#if tab === "diag"}
+        <div class="diag-wrap">
+          <div class="label green">ДИАГНОСТИКА</div>
+          <h2 class="h-px">Состояние туннеля</h2>
+          <div class="panel diag-panel">
+            <div class="diag-btns">
+              <button class="btn-px yellow" onclick={refreshDiag}>⟳ Обновить</button>
+              <button class="btn-px green" onclick={checkUpdate}>Проверить обновления</button>
+            </div>
+            {#if updateMsg}<p class="hint-text">{updateMsg}</p>{/if}
+            <pre class="diag-pre">{diagText || "нажми «Обновить», чтобы снять показания"}</pre>
+          </div>
+          <p class="hint-text dim">
+            rtt и путь (напрямую / релей) помогают разобраться, почему 🌐 вместо ⚡.
+          </p>
+        </div>
+      {/if}
     </div>
-  {:else}
-    <div class="col">
-      <p>{statusLine}</p>
-      {#each Object.entries(peers) as [id, p] (id)}
-        <p>{pathIcon(p.path)} до хоста: {p.rtt_ms} ms ({p.path})</p>
-      {/each}
-      <button class="danger" onclick={stopSession}>Отключиться</button>
-      {@render diagPanel()}
-    </div>
-  {/if}
-</main>
+
+    <!-- ===== FOOTER ===== -->
+    <footer class="footer">
+      <span>MineHost · одноранговый хостинг</span>
+      <span>v{appVersion || "?"} · {footerStatus}</span>
+    </footer>
+  </div>
+</div>
 
 <style>
-  :global(body) {
+  @keyframes mh-join {
+    0% {
+      opacity: 0;
+      transform: translateX(-14px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+  @keyframes mh-blink {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.25;
+    }
+  }
+  @keyframes mh-spin {
+    0% {
+      transform: rotate(0);
+    }
+    100% {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes mh-pulse {
+    0%,
+    100% {
+      opacity: 0.4;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  :global(html, body) {
     margin: 0;
-    font-family: system-ui, sans-serif;
-    background: #1a1d23;
-    color: #e8e8e8;
+    padding: 0;
+    box-sizing: border-box;
   }
-  main {
-    max-width: 440px;
-    margin: 0 auto;
-    padding: 24px;
+  :global(body) {
+    background: #101010;
+    color: #d6d6d6;
+    font-family: "VT323", "Courier New", monospace;
+    -webkit-font-smoothing: none;
   }
-  h1 {
-    text-align: center;
+  :global(*),
+  :global(*::before),
+  :global(*::after) {
+    box-sizing: border-box;
   }
-  .col {
+  :global(::-webkit-scrollbar) {
+    width: 12px;
+    height: 12px;
+    background: #101010;
+  }
+  :global(::-webkit-scrollbar-thumb) {
+    background: #2e2e2e;
+    border: 2px solid #000;
+  }
+  :global(button) {
+    font-family: inherit;
+  }
+
+  .page {
+    min-height: 100vh;
+    padding: 28px 20px;
     display: flex;
-    flex-direction: column;
-    gap: 12px;
+    justify-content: center;
+    align-items: flex-start;
+    background: #101010;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+    background-size: 24px 24px;
   }
-  button {
-    padding: 10px 16px;
-    border: none;
-    border-radius: 8px;
-    background: #3a7d44;
-    color: white;
-    font-size: 15px;
-    cursor: pointer;
+  .shell {
+    width: 100%;
+    max-width: 1080px;
+    background: #191919;
+    border: 2px solid #000;
+    box-shadow:
+      inset 2px 2px 0 #313131,
+      inset -2px -2px 0 #060606,
+      0 16px 50px rgba(0, 0, 0, 0.65);
   }
-  button:disabled {
-    opacity: 0.5;
-  }
-  button.big {
-    padding: 18px;
-    font-size: 17px;
+
+  /* ===== header ===== */
+  .header {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
     align-items: center;
+    gap: 16px;
+    padding: 16px 22px;
+    border-bottom: 2px solid #000;
+    background: #141414;
+    box-shadow: inset 0 2px 0 #2b2b2b;
   }
-  button.big small {
-    opacity: 0.7;
-    font-size: 12px;
+  .logo {
+    width: 44px;
+    height: 44px;
+    flex: 0 0 auto;
+    border: 2px solid #000;
+    box-shadow:
+      inset 2px 2px 0 rgba(255, 255, 255, 0.18),
+      inset -2px -2px 0 rgba(0, 0, 0, 0.5);
+    image-rendering: pixelated;
+    background: #6b4a2c;
   }
-  button.danger {
-    background: #8d3434;
+  .logo-grass {
+    height: 14px;
+    background: #5fa84e;
+    box-shadow:
+      inset 0 3px 0 #7ec85f,
+      inset 0 -2px 0 #3f7a36;
   }
-  .join-box {
+  .logo-dirt {
+    height: 6px;
+    background: #7a5230;
+  }
+  .title-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .app-title {
+    font-family: "Press Start 2P", monospace;
+    font-size: 18px;
+    color: #f4f4f4;
+    text-shadow: 3px 3px 0 #000;
+    letter-spacing: 1px;
+  }
+  .app-sub {
+    font-size: 18px;
+    color: #7d7d7d;
+    margin-top: 4px;
+    letter-spacing: 1px;
+  }
+  .status-chip {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 16px;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 12px;
+    border: 2px solid #000;
+    background: #101010;
+    box-shadow:
+      inset 2px 2px 0 #2a2a2a,
+      inset -2px -2px 0 #000;
   }
-  input {
-    padding: 10px;
-    border-radius: 8px;
-    border: 1px solid #444;
-    background: #23272f;
-    color: inherit;
-    font-size: 14px;
+  .status-chip span {
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    text-shadow: 2px 2px 0 #000;
   }
-  code.invite {
-    word-break: break-all;
-    background: #23272f;
-    padding: 12px;
-    border-radius: 8px;
+  .chip-dot {
+    width: 13px;
+    height: 13px;
+  }
+  .blink {
+    animation: mh-blink 1s infinite;
+  }
+
+  /* ===== nav ===== */
+  .nav {
+    display: flex;
+    gap: 0;
+    background: #101010;
+    border-bottom: 2px solid #000;
+    padding: 0 14px;
+  }
+  .nav-btn {
+    position: relative;
+    flex: 0 0 auto;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    padding: 15px 20px 12px;
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px;
+    color: #7d7d7d;
+    text-shadow: 2px 2px 0 #000;
+  }
+  .nav-btn:hover {
+    color: #fff;
+  }
+  .nav-btn.active {
+    color: #fff;
+  }
+  .nav-bar {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 0;
+    height: 3px;
+    background: transparent;
+  }
+  .nav-btn.active .nav-bar {
+    background: #5fbf4f;
+  }
+  .badge {
+    font-family: "VT323", monospace;
+    font-size: 16px;
+    margin-left: 7px;
+    padding: 1px 7px;
+    background: #2a2a2a;
+    color: #fff;
+    border: 2px solid #000;
+  }
+  .badge.on {
+    background: #3f8a30;
+  }
+
+  /* ===== content ===== */
+  .content {
+    padding: 30px 30px 36px;
+    min-height: 520px;
+  }
+
+  .error-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    margin-bottom: 22px;
+    padding: 12px 16px;
+    border: 2px solid #000;
+    background: #2a1414;
+    box-shadow:
+      inset 2px 2px 0 #4a2020,
+      inset -2px -2px 0 #000;
+  }
+  .eb-text {
+    font-size: 19px;
+    color: #ff8c86;
+    word-break: break-word;
+  }
+  .eb-x {
+    flex: 0 0 auto;
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    color: #d6504a;
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px;
+    text-shadow: 1px 1px 0 #000;
+  }
+
+  .label {
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px;
+    text-shadow: 2px 2px 0 #000;
+    letter-spacing: 2px;
+    margin-bottom: 12px;
+  }
+  .label.green {
+    color: #5fbf4f;
+  }
+  .label.yellow {
+    color: #f3c63a;
+  }
+  .h-px {
+    font-family: "Press Start 2P", monospace;
+    font-size: 20px;
+    font-weight: normal;
+    color: #f4f4f4;
+    text-shadow: 3px 3px 0 #000;
+    margin: 0 0 8px;
+    line-height: 1.5;
+  }
+
+  .panel {
+    padding: 18px;
+    border: 2px solid #000;
+    background: #141414;
+    box-shadow:
+      inset 2px 2px 0 #2e2e2e,
+      inset -2px -2px 0 #050505;
+  }
+
+  .hint-text {
+    font-size: 17px;
+    color: #7d7d7d;
+    line-height: 1.35;
+    margin: 12px 0 0;
+  }
+  .hint-text b {
+    color: #b8b8b8;
+  }
+  .hint-text.dim {
+    color: #5f5f5f;
+  }
+  .field-label {
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    color: #e4e4e4;
+    text-shadow: 2px 2px 0 #000;
+    margin: 14px 0 10px;
+  }
+  .field-label:first-child {
+    margin-top: 0;
+  }
+
+  .px-input {
+    width: 100%;
+    padding: 10px 12px;
+    border: 2px solid #000;
+    background: #0c0c0c;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000;
+    font-family: "VT323", "Courier New", monospace;
+    font-size: 21px;
+    color: #7ec8ff;
+  }
+  .px-input::placeholder {
+    color: #4a4a4a;
+  }
+  .px-input:focus {
+    outline: none;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000,
+      0 0 0 2px #5fbf4f;
+  }
+  .px-input:disabled {
+    opacity: 0.45;
+  }
+
+  /* pixel buttons */
+  .btn-px {
+    cursor: pointer;
+    padding: 13px 22px;
+    border: 2px solid #000;
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px;
+    color: #fff;
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.5);
+    box-shadow:
+      inset 2px 2px 0 rgba(255, 255, 255, 0.3),
+      inset -3px -3px 0 rgba(0, 0, 0, 0.4);
+  }
+  .btn-px:active:not(:disabled) {
+    transform: translateY(2px);
+    filter: brightness(0.92);
+  }
+  .btn-px:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .btn-px.green {
+    background: linear-gradient(#62c24f, #3f8a30);
+  }
+  .btn-px.green:hover:not(:disabled) {
+    background: linear-gradient(#6fd25b, #47993a);
+  }
+  .btn-px.yellow {
+    background: linear-gradient(#e0b93a, #b08a18);
+  }
+  .btn-px.yellow:hover:not(:disabled) {
+    background: linear-gradient(#ecc94e, #bd961f);
+  }
+  .btn-px.red {
+    background: linear-gradient(#c0463a, #8c2a22);
+  }
+  .btn-px.red:hover:not(:disabled) {
+    background: linear-gradient(#cf5448, #9a322a);
+  }
+  .btn-px.dark {
+    background: #222;
+    color: #c8c8c8;
+    box-shadow:
+      inset 1px 1px 0 #383838,
+      inset -1px -1px 0 #000;
+  }
+  .btn-px.dark:hover:not(:disabled) {
+    background: #2c2c2c;
+    color: #fff;
+  }
+  .btn-px.wide {
+    width: 100%;
+  }
+  .btn-px.tall {
+    padding: 17px 22px;
     font-size: 12px;
-    user-select: all;
   }
-  .error {
-    color: #ff7b7b;
+
+  /* ===== host tab ===== */
+  .host-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 24px;
+    align-items: start;
   }
-  .muted {
+  .seg3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .seg {
+    cursor: pointer;
+    padding: 13px 6px;
+    border: 2px solid #000;
+    background: #222;
+    box-shadow:
+      inset 1px 1px 0 #383838,
+      inset -1px -1px 0 #000;
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    color: #8a8a8a;
+    text-shadow: 1px 1px 0 #000;
+  }
+  .seg:hover:not(:disabled) {
+    color: #c8c8c8;
+  }
+  .seg.on {
+    background: linear-gradient(#62c24f, #3f8a30);
+    color: #fff;
+    box-shadow:
+      inset 2px 2px 0 rgba(255, 255, 255, 0.3),
+      inset -2px -2px 0 rgba(0, 0, 0, 0.4);
+  }
+  .seg:disabled {
+    cursor: default;
     opacity: 0.6;
   }
-  .mini {
-    padding: 2px 8px;
-    font-size: 12px;
+  .src-panel {
+    margin-bottom: 22px;
   }
-  .recent {
-    background: #2a4d7a;
-    text-align: left;
+  .src-panel .hint-text {
+    margin: 0;
+    font-size: 18px;
   }
-  .log {
-    font-family: monospace;
-    font-size: 11px;
+  .file-btn {
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .toggle-row {
+    width: 100%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    background: transparent;
+    border: none;
+    padding: 14px 0 0;
+  }
+  .toggle-row:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .toggle-label {
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    color: #e4e4e4;
+    text-shadow: 2px 2px 0 #000;
+  }
+  .track {
+    flex: 0 0 auto;
+    width: 50px;
+    height: 24px;
+    border: 2px solid #000;
+    background: #2a2a2a;
+    position: relative;
+    box-shadow: inset 1px 1px 0 rgba(0, 0, 0, 0.3);
+  }
+  .track.on {
+    background: #3f8a30;
+  }
+  .knob {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 20px;
+    background: #e0e0e0;
+    border: 1px solid #000;
+    box-shadow:
+      inset 1px 1px 0 #fff,
+      inset -1px -1px 0 #888;
+  }
+  .track.on .knob {
+    left: auto;
+    right: 0;
+  }
+  .server-log {
+    margin-top: 14px;
+    font-size: 16px;
+    color: #7d9d72;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  details {
-    background: #20242b;
-    border-radius: 8px;
-    padding: 8px 12px;
-  }
-  summary {
+
+  .host-toggle {
+    width: 100%;
     cursor: pointer;
-    opacity: 0.8;
+    padding: 30px 24px;
+    border: 2px solid #000;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    box-shadow:
+      inset 3px 3px 0 rgba(255, 255, 255, 0.32),
+      inset -4px -4px 0 rgba(0, 0, 0, 0.4);
   }
-  pre.diag {
+  .host-toggle:active:not(:disabled) {
+    transform: translateY(2px);
+    filter: brightness(0.92);
+  }
+  .host-toggle.green {
+    background: linear-gradient(#62c24f, #3f8a30);
+  }
+  .host-toggle.green:hover:not(:disabled) {
+    background: linear-gradient(#6fd25b, #47993a);
+  }
+  .host-toggle.yellow {
+    background: linear-gradient(#e0b93a, #b08a18);
+    cursor: default;
+  }
+  .host-toggle.red {
+    background: linear-gradient(#c0463a, #8c2a22);
+  }
+  .host-toggle.red:hover {
+    background: linear-gradient(#cf5448, #9a322a);
+  }
+  .host-toggle:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .glyph {
+    font-size: 46px;
+    line-height: 1;
+    color: #fff;
+    text-shadow: 3px 3px 0 rgba(0, 0, 0, 0.5);
+  }
+  .glyph.spin {
+    animation: mh-spin 1.4s linear infinite;
+    text-shadow: none;
+  }
+  .t-label {
+    font-family: "Press Start 2P", monospace;
+    font-size: 15px;
+    color: #fff;
+    text-shadow: 2px 2px 0 rgba(0, 0, 0, 0.55);
+  }
+  .t-hint {
+    font-size: 17px;
+    color: rgba(255, 255, 255, 0.78);
+  }
+
+  .status-panel {
+    margin-bottom: 22px;
+  }
+  .status-head {
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    margin-bottom: 16px;
+  }
+  .status-dot {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+  }
+  .status-label {
+    font-family: "Press Start 2P", monospace;
     font-size: 11px;
+    text-shadow: 2px 2px 0 #000;
+    line-height: 1.5;
+  }
+  .srow {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    white-space: nowrap;
+    padding: 10px 0;
+    border-top: 1px solid #000;
+  }
+  .srow .sk {
+    font-size: 18px;
+    color: #8a8a8a;
+  }
+  .srow .sv {
+    font-size: 18px;
+    color: #d6d6d6;
+  }
+
+  .invite-row {
+    display: flex;
+    gap: 10px;
+  }
+  .invite-box {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 12px 14px;
+    border: 2px solid #000;
+    background: #0c0c0c;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000;
+    font-size: 20px;
+    color: #7ec8ff;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    user-select: all;
+  }
+  .copy-btn {
+    flex: 0 0 auto;
+    padding: 0 18px;
+  }
+  .rotate-btn {
+    margin-top: 16px;
+  }
+  .dashed-box {
+    padding: 22px 18px;
+    border: 2px dashed #3a3a3a;
+    background: #0c0c0c;
+    text-align: center;
+    font-size: 19px;
+    color: #6f6f6f;
+  }
+
+  /* ===== join tab ===== */
+  .join-head {
+    margin-bottom: 20px;
+  }
+  .join-form {
+    margin-bottom: 28px;
+  }
+  .jf-grid {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .jf-grid .field-label {
+    margin-top: 0;
+  }
+  .recents-label {
+    margin-top: 4px;
+  }
+  .worlds-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+  }
+  .world-card {
+    text-align: left;
+    cursor: pointer;
+    padding: 0;
+    border: 2px solid #000;
+    background: #141414;
+    box-shadow:
+      inset 2px 2px 0 #2e2e2e,
+      inset -2px -2px 0 #050505;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    font-family: inherit;
+    color: inherit;
+  }
+  .world-card:hover:not(:disabled) {
+    box-shadow:
+      inset 2px 2px 0 #3f3f3f,
+      inset -2px -2px 0 #050505,
+      0 0 0 2px #5fbf4f;
+  }
+  .world-card:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .wc-preview {
+    position: relative;
+    height: 104px;
+    overflow: hidden;
+  }
+  .wc-sun {
+    position: absolute;
+    top: 14px;
+    right: 18px;
+    width: 20px;
+    height: 20px;
+    image-rendering: pixelated;
+  }
+  .wc-cloud {
+    position: absolute;
+    background: rgba(255, 255, 255, 0.18);
+  }
+  .wc-cloud.c1 {
+    top: 30px;
+    left: 24px;
+    width: 26px;
+    height: 7px;
+  }
+  .wc-cloud.c2 {
+    top: 40px;
+    left: 40px;
+    width: 18px;
+    height: 7px;
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .wc-ground {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 34px;
+  }
+  .wc-tex {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 7px;
+    background: repeating-linear-gradient(90deg, rgba(0, 0, 0, 0.18) 0 8px, transparent 8px 16px);
+  }
+  .wc-body {
+    padding: 14px 16px 16px;
+  }
+  .wc-name {
+    font-family: "Press Start 2P", monospace;
+    font-size: 12px;
+    color: #f0f0f0;
+    text-shadow: 2px 2px 0 #000;
+    line-height: 1.5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wc-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 12px;
+    font-size: 17px;
+    color: #8a8a8a;
+  }
+  .wc-pick {
+    color: #6f6f6f;
+  }
+  .wc-footer {
+    padding: 11px 16px;
+    border-top: 2px solid #000;
+    background: #101010;
+    font-family: "Press Start 2P", monospace;
+    font-size: 9px;
+    color: #5fbf4f;
+    text-shadow: 2px 2px 0 #000;
+  }
+
+  .join-session {
+    max-width: 680px;
+  }
+  .join-session .players-list {
+    margin: 20px 0;
+  }
+
+  /* ===== players tab ===== */
+  .players-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  .players-count {
+    text-align: right;
+  }
+  .pc-num {
+    font-family: "Press Start 2P", monospace;
+    font-size: 22px;
+    text-shadow: 2px 2px 0 #000;
+  }
+  .pc-sub {
+    font-size: 17px;
+    color: #7d7d7d;
+    margin-top: 6px;
+  }
+  .players-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .player-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border: 2px solid #000;
+    background: #141414;
+    box-shadow:
+      inset 2px 2px 0 #2a2a2a,
+      inset -2px -2px 0 #050505;
+  }
+  .player-row.joined {
+    animation: mh-join 0.25s both;
+  }
+  .p-head {
+    width: 46px;
+    height: 46px;
+    flex: 0 0 auto;
+    position: relative;
+    image-rendering: pixelated;
+    border: 2px solid #000;
+    box-shadow: inset -3px -3px 0 rgba(0, 0, 0, 0.22);
+  }
+  .ph-hair {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 15px;
+  }
+  .ph-eye,
+  .ph-pupil {
+    position: absolute;
+    top: 18px;
+    width: 7px;
+    height: 7px;
+  }
+  .ph-eye {
+    background: #fff;
+  }
+  .ph-eye.l,
+  .ph-pupil.l {
+    left: 8px;
+  }
+  .ph-eye.r,
+  .ph-pupil.r {
+    right: 8px;
+  }
+  .ph-mouth {
+    position: absolute;
+    bottom: 7px;
+    left: 14px;
+    right: 14px;
+    height: 4px;
+    background: rgba(0, 0, 0, 0.3);
+  }
+  .p-info {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .p-name {
+    font-family: "Press Start 2P", monospace;
+    font-size: 12px;
+    color: #f0f0f0;
+    text-shadow: 2px 2px 0 #000;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .p-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 17px;
+    color: #7d9d72;
+  }
+  .p-dot {
+    width: 9px;
+    height: 9px;
+    background: #5fbf4f;
+    box-shadow: 0 0 6px #5fbf4f;
+  }
+  .sig {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 22px;
+  }
+  .bar {
+    width: 5px;
+  }
+  .ping {
+    width: 78px;
+    text-align: right;
+    font-size: 20px;
+  }
+  .kick-btn {
+    flex: 0 0 auto;
+    cursor: pointer;
+    padding: 8px 11px;
+    border: 2px solid #000;
+    background: #2a1414;
+    box-shadow:
+      inset 1px 1px 0 #4a2020,
+      inset -1px -1px 0 #000;
+    font-family: "Press Start 2P", monospace;
+    font-size: 8px;
+    color: #d6504a;
+    text-shadow: 1px 1px 0 #000;
+  }
+  .kick-btn:hover {
+    background: #3a1a1a;
+  }
+
+  .empty-block {
+    padding: 60px 20px;
+    text-align: center;
+    border: 2px dashed #2e2e2e;
+    background: #0e0e0e;
+  }
+  .empty-icon {
+    font-size: 34px;
+    margin-bottom: 16px;
+  }
+  .empty-icon.pulse {
+    animation: mh-pulse 1.4s infinite;
+  }
+  .off-dot {
+    width: 18px;
+    height: 18px;
+    background: #d6504a;
+    margin: 0 auto 18px;
+    box-shadow:
+      inset 2px 2px 0 rgba(255, 255, 255, 0.35),
+      0 0 10px rgba(214, 80, 74, 0.5);
+  }
+  .empty-title {
+    font-family: "Press Start 2P", monospace;
+    font-size: 13px;
+    color: #9a9a9a;
+    text-shadow: 2px 2px 0 #000;
+    line-height: 1.7;
+  }
+  .empty-sub {
+    font-size: 18px;
+    color: #6f6f6f;
+    margin-top: 14px;
+  }
+  .empty-block .btn-px {
+    margin-top: 20px;
+  }
+
+  /* ===== diag tab ===== */
+  .diag-wrap {
+    max-width: 680px;
+  }
+  .diag-panel {
+    margin-top: 12px;
+  }
+  .diag-btns {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .diag-pre {
+    margin: 16px 0 0;
+    font-family: "VT323", "Courier New", monospace;
+    font-size: 17px;
+    line-height: 1.25;
     overflow-x: auto;
-    background: #23272f;
-    padding: 8px;
-    border-radius: 8px;
+    background: #0c0c0c;
+    border: 2px solid #000;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000;
+    color: #7ec8ff;
+    padding: 12px 14px;
     white-space: pre-wrap;
     word-break: break-all;
   }
-  ul {
-    list-style: none;
-    padding: 0;
+
+  /* ===== footer ===== */
+  .footer {
+    padding: 13px 22px;
+    border-top: 2px solid #000;
+    background: #101010;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 16px;
+    color: #5a5a5a;
+    letter-spacing: 0.5px;
+  }
+
+  @media (max-width: 860px) {
+    .host-grid {
+      grid-template-columns: 1fr;
+    }
+    .worlds-grid {
+      grid-template-columns: 1fr;
+    }
+    .jf-grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>
