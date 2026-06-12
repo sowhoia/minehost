@@ -52,15 +52,17 @@ CLI без GUI (для отладки): `cargo run -p mine-host-core --example h
 
 ## Релизы и автообновления
 
-CI (`.github/workflows/`) гоняет тесты на трёх ОС и по тегу `v*` собирает
-установщики через tauri-action. Чтобы включить:
+CI (`.github/workflows/`) гоняет тесты на трёх ОС; тег `v*` собирает
+установщики Win/macOS/Linux через tauri-action в draft-релиз GitHub
+вместе с `latest.json` для автообновлений (кнопка «Проверить обновления»
+в панели диагностики).
 
-1. Создай GitHub-репозиторий и запушь код (`gh repo create`).
-2. В `app/src-tauri/tauri.conf.json` замени `OWNER` в `plugins.updater.endpoints`
-   на свой аккаунт.
-3. Добавь секреты репозитория: `TAURI_SIGNING_PRIVATE_KEY` — содержимое
-   `~/.tauri/minehost.key` (приватный ключ updater-подписи, НЕ коммитить),
-   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — пусто, если ключ без пароля.
-4. `git tag v0.2.0 && git push --tags` → draft-релиз с установщиками
-   и `latest.json` для автообновлений (кнопка «Проверить обновления»
-   в панели диагностики).
+Выпуск новой версии:
+
+1. Подними `version` в `app/src-tauri/tauri.conf.json`.
+2. `git tag vX.Y.Z && git push --tags`.
+3. Опубликуй draft-релиз на GitHub.
+
+Подпись обновлений: приватный ключ — `~/.tauri/minehost.key` (НЕ коммитить,
+не терять); в репозитории он задан секретами `TAURI_SIGNING_PRIVATE_KEY`
+и `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
