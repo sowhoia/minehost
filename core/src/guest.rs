@@ -21,16 +21,25 @@ pub struct GuestOptions {
     pub preferred_port: Option<u16>,
 }
 
+type SharedConn = std::sync::Arc<tokio::sync::Mutex<Option<Connection>>>;
+
 pub struct GuestSession {
     pub local_port: u16,
     events: Option<mpsc::Receiver<Event>>,
     endpoint: Endpoint,
     main_task: tokio::task::JoinHandle<()>,
+    current_conn: SharedConn,
 }
 
 impl GuestSession {
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.events.take()
+    }
+
+    /// Снимок состояния соединения с хостом (None — не подключены).
+    pub async fn diagnostics(&self) -> Option<crate::net::Diagnostics> {
+        let conn = self.current_conn.lock().await.clone()?;
+        Some(crate::net::diagnostics(&self.endpoint, &conn).await)
     }
 
     pub async fn close(self) {
@@ -59,12 +68,14 @@ pub async fn join(opts: GuestOptions) -> Result<GuestSession> {
     let listener = bind_local(opts.preferred_port).await.context("bind local proxy")?;
     let local_port = listener.local_addr()?.port();
     let (tx, rx) = mpsc::channel::<Event>(64);
+    let current_conn: SharedConn = Default::default();
 
     let ep = endpoint.clone();
     let name = opts.player_name.clone();
-    let main_task = tokio::spawn(run_guest(ep, addr, listener, local_port, name, tx));
+    let conn_slot = current_conn.clone();
+    let main_task = tokio::spawn(run_guest(ep, addr, listener, local_port, name, tx, conn_slot));
 
-    Ok(GuestSession { local_port, events: Some(rx), endpoint, main_task })
+    Ok(GuestSession { local_port, events: Some(rx), endpoint, main_task, current_conn })
 }
 
 /// Главный цикл: подключение → обслуживание → переподключение с backoff.
@@ -75,17 +86,20 @@ async fn run_guest(
     local_port: u16,
     player_name: String,
     tx: mpsc::Sender<Event>,
+    conn_slot: SharedConn,
 ) {
     let mut attempt: u32 = 0;
     loop {
         match ep.connect(addr.clone(), ALPN).await {
             Ok(conn) => {
                 attempt = 0;
+                *conn_slot.lock().await = Some(conn.clone());
                 let reason = serve_conn(&ep, &conn, &listener, local_port, &player_name, &tx)
                     .await
                     .err()
                     .map(|e| format!("{e:#}"))
                     .unwrap_or_else(|| "connection closed".into());
+                *conn_slot.lock().await = None;
                 let _ = tx.send(Event::Disconnected { reason }).await;
             }
             Err(e) => {

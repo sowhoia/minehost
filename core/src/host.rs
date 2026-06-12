@@ -54,6 +54,16 @@ impl HostSession {
         }
     }
 
+    /// Диагностика всех активных гостевых соединений.
+    pub async fn diagnostics(&self) -> Vec<crate::net::Diagnostics> {
+        let conns: Vec<Connection> = self.conns.lock().await.values().cloned().collect();
+        let mut out = Vec::new();
+        for c in conns {
+            out.push(crate::net::diagnostics(&self.endpoint, &c).await);
+        }
+        out
+    }
+
     /// Снимок активных гостей: (id, rtt_ms).
     pub async fn guests(&self) -> Vec<(String, u32)> {
         self.conns

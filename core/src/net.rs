@@ -35,6 +35,38 @@ pub fn conn_rtt_ms(conn: &Connection) -> u32 {
         .unwrap_or(0)
 }
 
+/// Снимок состояния соединения для экрана диагностики.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Diagnostics {
+    pub peer_id: String,
+    pub rtt_ms: u32,
+    pub path: crate::events::PathKind,
+    /// Активные транспортные адреса пира: Ip(..) / Relay(..).
+    pub addrs: Vec<String>,
+    /// Наши собственные адреса (что узнает о нас пир).
+    pub self_addrs: Vec<String>,
+}
+
+pub async fn diagnostics(ep: &Endpoint, conn: &Connection) -> Diagnostics {
+    let id = conn.remote_id();
+    let mut addrs = Vec::new();
+    if let Some(info) = ep.remote_info(id).await {
+        for a in info.addrs() {
+            if matches!(a.usage(), TransportAddrUsage::Active) {
+                addrs.push(format!("{:?}", a.addr()));
+            }
+        }
+    }
+    let self_addrs = ep.addr().addrs.iter().map(|a| format!("{a:?}")).collect();
+    Diagnostics {
+        peer_id: id.to_string(),
+        rtt_ms: conn_rtt_ms(conn),
+        path: path_kind(ep, id).await,
+        addrs,
+        self_addrs,
+    }
+}
+
 /// Направление пути к пиру: напрямую или через релей.
 /// Смотрим активные транспортные адреса пира из remote_info.
 pub async fn path_kind(ep: &Endpoint, id: iroh::EndpointId) -> crate::events::PathKind {
