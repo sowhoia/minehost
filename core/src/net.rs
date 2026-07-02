@@ -1,6 +1,8 @@
 //! Адаптер над iroh::Endpoint. Вся специфика версии iroh — здесь.
 use anyhow::Result;
-use iroh::endpoint::{presets, Connection, PathId, QuicTransportConfig, TransportAddrUsage, VarInt};
+use iroh::endpoint::{
+    presets, Connection, PathId, QuicTransportConfig, TransportAddrUsage, VarInt,
+};
 use iroh::{Endpoint, SecretKey};
 
 use crate::ALPN;
@@ -8,18 +10,29 @@ use crate::ALPN;
 /// relays=false — герметичный режим для тестов (без сети n0:
 /// presets::Minimal ставит только обязательный crypto provider).
 pub async fn make_endpoint(secret_key: Option<SecretKey>, relays: bool) -> Result<Endpoint> {
-    let mut builder = if relays {
-        Endpoint::builder(presets::N0)
-    } else {
-        Endpoint::builder(presets::Minimal)
-    };
+    let mut builder =
+        if relays { Endpoint::builder(presets::N0) } else { Endpoint::builder(presets::Minimal) };
     builder = builder.alpns(vec![ALPN.to_vec()]);
-    // Дефолтные окна noq рассчитаны на 100 Мбит/100 мс. Логин в тяжёлый модпак —
-    // всплеск в десятки МБ по одному потоку; поднимаем окна, чтобы не душить его.
+    // Окна — компромисс «пропускная способность ↔ задержка». Гигантские окна
+    // (16-64 МБ) — это bufferbloat: когда аплоад хоста медленнее, чем Minecraft
+    // отдаёт чанки, туннель копит многосекундную очередь, пинг растёт без
+    // предела, keep-alive'ы тонут за чанками и клиента выкидывает по таймауту.
+    // 3 МБ на поток ≈ 120 Мбит/с при RTT 200 мс — логину в тяжёлый модпак
+    // хватает, а очередь ограничена долями секунды; дальше backpressure по TCP
+    // доходит до сервера, и Netty сам притормаживает отправку чанков.
     let transport = QuicTransportConfig::builder()
-        .stream_receive_window(VarInt::from_u32(16 * 1024 * 1024))
-        .receive_window(VarInt::from_u32(64 * 1024 * 1024))
-        .send_window(64 * 1024 * 1024)
+        .stream_receive_window(VarInt::from_u32(3 * 1024 * 1024))
+        .receive_window(VarInt::from_u32(8 * 1024 * 1024))
+        .send_window(8 * 1024 * 1024)
+        // BBR держит очередь у бутылочного горлышка минимальной. Дефолтный
+        // Cubic заполняет буферы домашнего роутера/релея до потерь — именно
+        // так выглядит «пинг всё больше и больше» под нагрузкой.
+        .congestion_controller_factory(std::sync::Arc::new(
+            noq_proto::congestion::BbrConfig::default(),
+        ))
+        // Голосовые датаграммы: маленький буфер отправки — лучше потерять
+        // кадр, чем проиграть его с секундным опозданием.
+        .datagram_send_buffer_size(64 * 1024)
         .build();
     builder = builder.transport_config(transport);
     if let Some(key) = secret_key {
@@ -30,9 +43,7 @@ pub async fn make_endpoint(secret_key: Option<SecretKey>, relays: bool) -> Resul
 
 /// Текущая оценка RTT соединения в миллисекундах (0 — пока неизвестно).
 pub fn conn_rtt_ms(conn: &Connection) -> u32 {
-    conn.rtt(PathId::ZERO)
-        .map(|d| d.as_millis() as u32)
-        .unwrap_or(0)
+    conn.rtt(PathId::ZERO).map(|d| d.as_millis() as u32).unwrap_or(0)
 }
 
 /// Снимок состояния соединения для экрана диагностики.

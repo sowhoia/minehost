@@ -8,6 +8,11 @@ anyhow = "1"
 bytes = "1"
 iroh = "0.98.2"
 iroh-tickets = "0.5.0"
+# QUIC-стек iroh; нужен напрямую ради congestion::BbrConfig (iroh реэкспортирует
+# только трейты). Версия обязана совпадать с той, что тянет iroh — при бампе
+# iroh сверяй его lock-версию noq-proto. default-features=false обязательно:
+# дефолтная фича bloom требует неопубликованный fastbloom 0.17.
+noq-proto = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # features=["all"]: set_reuse_port и прочие unix-методы

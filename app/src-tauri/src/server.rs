@@ -47,20 +47,34 @@ pub async fn start(
     let mut child = Command::new("java")
         .current_dir(&dir)
         .args([
-            &format!("-Xms{}M", ram_mb.min(2048)),
+            // Xms=Xmx + AlwaysPreTouch — по Айкару: без ресайзов кучи в рантайме
+            &format!("-Xms{ram_mb}M"),
             &format!("-Xmx{ram_mb}M"),
-            // флаги Айкара — стандарт для игровых серверов
+            // полный набор флагов Айкара — меньше GC-пауз (= лагов) на сервере
             "-XX:+UseG1GC",
             "-XX:+ParallelRefProcEnabled",
             "-XX:MaxGCPauseMillis=200",
             "-XX:+UnlockExperimentalVMOptions",
             "-XX:+DisableExplicitGC",
+            "-XX:+AlwaysPreTouch",
+            "-XX:G1NewSizePercent=30",
+            "-XX:G1MaxNewSizePercent=40",
+            "-XX:G1HeapRegionSize=8M",
+            "-XX:G1ReservePercent=20",
+            "-XX:G1HeapWastePercent=5",
+            "-XX:G1MixedGCCountTarget=4",
+            "-XX:InitiatingHeapOccupancyPercent=15",
+            "-XX:G1MixedGCLiveThresholdPercent=90",
+            "-XX:G1RSetUpdatingPauseTimePercent=5",
+            "-XX:SurvivorRatio=32",
+            "-XX:+PerfDisableSharedMem",
+            "-XX:MaxTenuringThreshold=1",
             "-jar",
         ])
         .arg(&jar)
         .arg("nogui")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -75,6 +89,16 @@ pub async fn start(
                 let _ = app.emit("mh-server-log", &line);
             }
             let _ = app.emit("mh-server-log", "[процесс сервера завершился]");
+        });
+    }
+    // stderr тоже в UI: раньше падения JVM и ошибки флагов уходили в никуда
+    if let Some(err) = child.stderr.take() {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = app.emit("mh-server-log", &line);
+            }
         });
     }
     *state.0.lock().await = Some(child);

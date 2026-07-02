@@ -11,12 +11,21 @@ pub const STREAM_TCP: u8 = 0x01;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum CtrlMsg {
     /// Гость представляется (первое сообщение гостя).
-    Hello { name: String },
+    Hello {
+        name: String,
+    },
     /// Хост сообщает имя мира (ответ на Hello).
-    Info { world_name: String },
-    Ping { seq: u64 },
+    Info {
+        world_name: String,
+    },
+    Ping {
+        seq: u64,
+    },
     /// mc_online=false — Minecraft хоста не отвечает на локальном порту.
-    Pong { seq: u64, mc_online: bool },
+    Pong {
+        seq: u64,
+        mc_online: bool,
+    },
 }
 
 /// JSON-строка с \n — простой самосинхронизирующийся фрейминг.

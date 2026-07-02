@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendDatagramError};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
@@ -90,8 +90,10 @@ async fn run_guest(
 ) {
     let mut attempt: u32 = 0;
     loop {
-        match ep.connect(addr.clone(), ALPN).await {
-            Ok(conn) => {
+        // Таймаут — чтобы зависший хендшейк (смена сети, полумёртвый NAT)
+        // не останавливал цикл переподключения навсегда.
+        match tokio::time::timeout(Duration::from_secs(15), ep.connect(addr.clone(), ALPN)).await {
+            Ok(Ok(conn)) => {
                 attempt = 0;
                 *conn_slot.lock().await = Some(conn.clone());
                 let reason = serve_conn(&ep, &conn, &listener, local_port, &player_name, &tx)
@@ -102,13 +104,15 @@ async fn run_guest(
                 *conn_slot.lock().await = None;
                 let _ = tx.send(Event::Disconnected { reason }).await;
             }
-            Err(e) => {
-                tracing::debug!("connect failed: {e:#}");
-            }
+            Ok(Err(e)) => tracing::debug!("connect failed: {e:#}"),
+            Err(_) => tracing::debug!("connect timed out"),
         }
         attempt += 1;
         let _ = tx.send(Event::Reconnecting { attempt }).await;
-        tokio::time::sleep(backoff(attempt)).await;
+        // Первая попытка — быстрая: обрыв чаще всего мгновенно устраним
+        // (хост перезапустился, сеть моргнула). Длинный backoff — при повторных.
+        let delay = if attempt == 1 { Duration::from_millis(500) } else { backoff(attempt) };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -123,9 +127,14 @@ async fn serve_conn(
 ) -> Result<()> {
     // Контрольный канал: hello → info, дальше ping-тикер.
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await?;
+    // Пинги не должны стоять в очереди за чанками мира.
+    let _ = ctrl_send.set_priority(1);
     ctrl_send.write_all(&[protocol::STREAM_CTRL]).await?;
-    protocol::write_msg(&mut ctrl_send, &protocol::CtrlMsg::Hello { name: player_name.to_string() })
-        .await?;
+    protocol::write_msg(
+        &mut ctrl_send,
+        &protocol::CtrlMsg::Hello { name: player_name.to_string() },
+    )
+    .await?;
     let mut ctrl_reader = BufReader::new(ctrl_recv);
 
     // Ждём Info с именем мира, поднимаем LAN-маяк.
@@ -135,19 +144,16 @@ async fn serve_conn(
     };
     // Маяк — UX-сахар: без него мир не появится в LAN-списке, но туннель
     // обязан жить (можно подключиться вручную по 127.0.0.1:порт).
-    let _beacon = match LanBeacon::start(LanAnnounce {
-        motd: format!("{world_name} ⚡"),
-        port: local_port,
-    }) {
-        Ok(b) => Some(b),
-        Err(e) => {
-            tracing::warn!("LAN-маяк недоступен: {e:#}");
-            None
-        }
-    };
-    let _ = tx
-        .send(Event::JoinedHost { local_port, world_name: world_name.clone() })
-        .await;
+    let _beacon =
+        match LanBeacon::start(LanAnnounce { motd: format!("{world_name} ⚡"), port: local_port })
+        {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!("LAN-маяк недоступен: {e:#}");
+                None
+            }
+        };
+    let _ = tx.send(Event::JoinedHost { local_port, world_name: world_name.clone() }).await;
 
     // Читаем ответы хоста: Pong несёт mc_online («хост офлайн» в UI).
     // Читать обязательно — иначе непрочитанные Pong'и со временем
@@ -178,7 +184,8 @@ async fn serve_conn(
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             seq += 1;
-            if protocol::write_msg(&mut ping_send, &protocol::CtrlMsg::Ping { seq }).await.is_err() {
+            if protocol::write_msg(&mut ping_send, &protocol::CtrlMsg::Ping { seq }).await.is_err()
+            {
                 break;
             }
             if ping_conn.close_reason().is_some() {
@@ -217,12 +224,16 @@ async fn serve_conn(
         tokio::select! {
             accepted = listener.accept() => {
                 let (mut tcp, _) = accepted?;
+                // Nagle + delayed ACK добавляют до ~40-200 мс мелким игровым пакетам.
+                let _ = tcp.set_nodelay(true);
                 let conn = conn.clone();
                 tokio::spawn(async move {
                     let Ok((mut send, recv)) = conn.open_bi().await else { return };
                     if send.write_all(&[protocol::STREAM_TCP]).await.is_err() { return; }
                     let mut quic = tokio::io::join(recv, send);
-                    let _ = tokio::io::copy_bidirectional(&mut tcp, &mut quic).await;
+                    let _ = tokio::io::copy_bidirectional_with_sizes(
+                        &mut tcp, &mut quic, crate::COPY_BUF, crate::COPY_BUF,
+                    ).await;
                 });
             }
             _ = conn.closed() => break Ok(()),
@@ -256,11 +267,18 @@ async fn datagram_bridge_guest(conn: Connection, local_port: u16) {
         }
     });
     let from_local = tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok((n, src)) = sock.recv_from(&mut buf).await {
-            *last_src.lock().await = Some(src);
-            if conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
-                break;
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sock.recv_from(&mut buf).await {
+                Ok((n, src)) => {
+                    *last_src.lock().await = Some(src);
+                    match conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])) {
+                        // Пакет больше MTU пути — дропаем кадр, мост живёт дальше.
+                        Ok(()) | Err(SendDatagramError::TooLarge) => {}
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         }
     });

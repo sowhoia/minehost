@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, SendDatagramError};
 use iroh::{Endpoint, SecretKey};
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::events::Event;
 use crate::{invite, net, protocol};
@@ -97,27 +97,55 @@ pub async fn start(opts: HostOptions) -> Result<HostSession> {
     let world_name = opts.world_name.clone();
     let accept_conns = conns.clone();
     let accept_blocked = blocked.clone();
+    // Пробер живёт, пока жив accept_task (он держит receiver).
+    let mc_status = spawn_mc_prober(port);
     let accept_task = tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
-            let Ok(conn) = incoming.await else { continue };
-            let id = conn.remote_id().to_string();
-            if accept_blocked.lock().await.contains(&id) {
-                conn.close(0u32.into(), b"blocked");
-                continue;
-            }
-            accept_conns.lock().await.insert(id, conn.clone());
-            tokio::spawn(handle_conn(
-                ep.clone(),
-                conn,
-                port,
-                world_name.clone(),
-                tx.clone(),
-                accept_conns.clone(),
-            ));
+            let ep = ep.clone();
+            let world_name = world_name.clone();
+            let tx = tx.clone();
+            let conns = accept_conns.clone();
+            let blocked = accept_blocked.clone();
+            let mc_status = mc_status.clone();
+            // Хендшейк — в отдельной задаче: медленный или зависший гость
+            // не мешает подключаться остальным.
+            tokio::spawn(async move {
+                let Ok(conn) = incoming.await else { return };
+                let id = conn.remote_id().to_string();
+                if blocked.lock().await.contains(&id) {
+                    conn.close(0u32.into(), b"blocked");
+                    return;
+                }
+                conns.lock().await.insert(id, conn.clone());
+                handle_conn(ep, conn, port, world_name, tx, conns, mc_status).await;
+            });
         }
     });
 
     Ok(HostSession { invite_code, events: Some(rx), endpoint, accept_task, conns, blocked })
+}
+
+/// Один пробер на сессию: гости читают кэш из watch-канала вместо того, чтобы
+/// на каждый Ping каждого гостя открывать своё TCP-соединение к Minecraft
+/// (спам подключений на сервер + до 500 мс блокировки контрольного канала).
+fn spawn_mc_prober(port: u16) -> watch::Receiver<bool> {
+    let (tx, rx) = watch::channel(true);
+    tokio::spawn(async move {
+        loop {
+            let online = tokio::time::timeout(
+                Duration::from_millis(750),
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            if tx.send(online).is_err() {
+                break; // сессия закрыта — читателей больше нет
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+    rx
 }
 
 async fn handle_conn(
@@ -127,6 +155,7 @@ async fn handle_conn(
     world_name: String,
     tx: mpsc::Sender<Event>,
     conns: ConnMap,
+    mc_status: watch::Receiver<bool>,
 ) {
     let remote_id = conn.remote_id();
     let id_str = remote_id.to_string();
@@ -164,8 +193,10 @@ async fn handle_conn(
                 let tx = tx.clone();
                 let world = world_name.clone();
                 let id = id_str.clone();
+                let mc_status = mc_status.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(send, recv, port, world, id, tx).await {
+                    if let Err(e) = handle_stream(send, recv, port, world, id, tx, mc_status).await
+                    {
                         tracing::debug!("stream ended: {e:#}");
                     }
                 });
@@ -186,16 +217,28 @@ async fn handle_stream(
     world_name: String,
     guest_id: String,
     tx: mpsc::Sender<Event>,
+    mc_status: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut tag = [0u8; 1];
     recv.read_exact(&mut tag).await?;
     match tag[0] {
         protocol::STREAM_TCP => {
-            let mut tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+            let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+            // Nagle + delayed ACK добавляют до ~40-200 мс мелким игровым пакетам.
+            let _ = tcp.set_nodelay(true);
+            let mut tcp = tcp;
             let mut quic = tokio::io::join(recv, send);
-            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut quic).await;
+            let _ = tokio::io::copy_bidirectional_with_sizes(
+                &mut tcp,
+                &mut quic,
+                crate::COPY_BUF,
+                crate::COPY_BUF,
+            )
+            .await;
         }
         protocol::STREAM_CTRL => {
+            // Контрольные сообщения не должны стоять в очереди за чанками.
+            let _ = send.set_priority(1);
             let mut reader = BufReader::new(recv);
             while let Some(msg) = protocol::read_msg(&mut reader).await? {
                 match msg {
@@ -208,15 +251,9 @@ async fn handle_stream(
                         .await?;
                     }
                     protocol::CtrlMsg::Ping { seq } => {
-                        // Заодно проверяем, жив ли Minecraft хоста: гость покажет
-                        // «хост офлайн» вместо молчаливо мёртвого мира.
-                        let mc_online = tokio::time::timeout(
-                            Duration::from_millis(500),
-                            TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-                        )
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
+                        // Кэш общего пробера: гость покажет «хост офлайн» вместо
+                        // молчаливо мёртвого мира, а Pong уходит мгновенно.
+                        let mc_online = *mc_status.borrow();
                         protocol::write_msg(&mut send, &protocol::CtrlMsg::Pong { seq, mc_online })
                             .await?;
                     }
@@ -232,7 +269,9 @@ async fn handle_stream(
 /// Мост QUIC-датаграммы ↔ локальный UDP (голосовые моды).
 /// На каждое соединение — свой сокет: ответы сервера уходят нужному гостю.
 async fn datagram_bridge_host(conn: Connection, port: u16) {
-    let Ok(sock) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await else { return };
+    let Ok(sock) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await else {
+        return;
+    };
     if sock.connect((Ipv4Addr::LOCALHOST, port)).await.is_err() {
         return;
     }
@@ -246,10 +285,17 @@ async fn datagram_bridge_host(conn: Connection, port: u16) {
         }
     });
     let from_local = tokio::spawn(async move {
-        let mut buf = [0u8; 1500];
-        while let Ok(n) = sock.recv(&mut buf).await {
-            if conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
-                break;
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sock.recv(&mut buf).await {
+                Ok(n) => match conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])) {
+                    // Пакет больше MTU пути — дропаем кадр, мост живёт дальше.
+                    Ok(()) | Err(SendDatagramError::TooLarge) => {}
+                    Err(_) => break,
+                },
+                // ECONNREFUSED от ICMP «порт недоступен» (голосовой мод ещё не
+                // запущен) — не повод навсегда убивать мост.
+                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
             }
         }
     });
