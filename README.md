@@ -36,7 +36,7 @@
 прямо в имени файла:
 
 - `MineHost_windows_…-setup.exe` — Windows;
-- `MineHost_macos_….dmg` — macOS;
+- `MineHost_macos-AppleSilicon_….dmg` — macOS на Apple Silicon (M1–M4);
 - `MineHost_linux_….AppImage` / `.deb` / `.rpm` — Linux.
 
 **macOS пишет «приложение повреждено»?** Сборка пока не подписана

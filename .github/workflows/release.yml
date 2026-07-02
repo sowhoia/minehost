@@ -28,6 +28,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # ключ подписи сгенерирован без пароля
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # Подпись macOS (Developer ID Application): убирает «приложение
+          # повреждено» → остаётся мягкое «непроверенный разработчик» с
+          # кнопкой «Открыть». Нотаризация сознательно не настроена
+          # (для неё понадобились бы APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
@@ -60,6 +67,8 @@ jobs:
             case "$base" in *.sig) sig=".sig" base="${base%.sig}" ;; esac
             case "$base" in
               *.msi|*.exe|*.nsis.zip|*.msi.zip) plat="windows" ;;
+              # «aarch64» мало кому что-то говорит — пишем Apple Silicon явно
+              *aarch64*.dmg|*aarch64*.app.tar.gz) plat="macos-AppleSilicon" ;;
               *.dmg|*.app.tar.gz)               plat="macos"   ;;
               *.AppImage|*.deb|*.rpm)           plat="linux"   ;;
               *) continue ;;
