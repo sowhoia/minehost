@@ -54,6 +54,22 @@ async fn udp_roundtrip_through_tunnel() {
     }
     assert_eq!(got.as_deref(), Some(b"opus-frame".as_slice()));
 
+    // Пакет больше лимита QUIC-датаграммы (~1200 байт) должен быть молча
+    // отброшен, НЕ убивая мост: следующий обычный кадр обязан пройти.
+    voice.send_to(&[0u8; 5000], ("127.0.0.1", guest.local_port)).await.unwrap();
+    let mut got2 = None;
+    for _ in 0..10 {
+        voice.send_to(b"still-alive", ("127.0.0.1", guest.local_port)).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(2), voice.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if &buf[..n] == b"still-alive" => {
+                got2 = Some(buf[..n].to_vec());
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert_eq!(got2.as_deref(), Some(b"still-alive".as_slice()), "мост умер после TooLarge-пакета");
+
     guest.close().await;
     host.close().await;
 }

@@ -88,20 +88,46 @@ async fn run_guest(
     tx: mpsc::Sender<Event>,
     conn_slot: SharedConn,
 ) {
+    // Голосовой UDP-сокет и адрес голосового клиента живут через
+    // переподключения: перебинд на каждый reconnect гонялся со старой
+    // задачей за порт, проигрывал и оставлял голос мёртвым до конца сессии.
+    let last_src: LastVoiceSrc = Default::default();
+    let mut voice_sock: Option<std::sync::Arc<tokio::net::UdpSocket>> = None;
+
     let mut attempt: u32 = 0;
     loop {
+        if voice_sock.is_none() {
+            match tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, local_port)).await {
+                Ok(s) => voice_sock = Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!("UDP {local_port} занят — голосовые моды не будут работать: {e}")
+                }
+            }
+        }
         // Таймаут — чтобы зависший хендшейк (смена сети, полумёртвый NAT)
         // не останавливал цикл переподключения навсегда.
         match tokio::time::timeout(Duration::from_secs(15), ep.connect(addr.clone(), ALPN)).await {
             Ok(Ok(conn)) => {
                 attempt = 0;
                 *conn_slot.lock().await = Some(conn.clone());
-                let reason = serve_conn(&ep, &conn, &listener, local_port, &player_name, &tx)
-                    .await
-                    .err()
-                    .map(|e| format!("{e:#}"))
-                    .unwrap_or_else(|| "connection closed".into());
+                let reason = serve_conn(
+                    &ep,
+                    &conn,
+                    &listener,
+                    local_port,
+                    &player_name,
+                    &tx,
+                    voice_sock.clone(),
+                    last_src.clone(),
+                )
+                .await
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_else(|| "connection closed".into());
                 *conn_slot.lock().await = None;
+                // Явно закрываем: живые клоны Connection (мост датаграмм) не
+                // должны держать старое соединение параллельно с новым.
+                conn.close(0u32.into(), b"reconnect");
                 let _ = tx.send(Event::Disconnected { reason }).await;
             }
             Ok(Err(e)) => tracing::debug!("connect failed: {e:#}"),
@@ -117,6 +143,7 @@ async fn run_guest(
 }
 
 /// Обслуживает одно соединение до его закрытия.
+#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
     ep: &Endpoint,
     conn: &Connection,
@@ -124,6 +151,8 @@ async fn serve_conn(
     local_port: u16,
     player_name: &str,
     tx: &mpsc::Sender<Event>,
+    voice_sock: Option<std::sync::Arc<tokio::net::UdpSocket>>,
+    last_src: LastVoiceSrc,
 ) -> Result<()> {
     // Контрольный канал: hello → info, дальше ping-тикер.
     let (mut ctrl_send, ctrl_recv) = conn.open_bi().await?;
@@ -173,8 +202,11 @@ async fn serve_conn(
         })
     };
 
-    // Мост датаграмм для голосовых модов (Task 9 наполнит функцию).
-    tokio::spawn(datagram_bridge_guest(conn.clone(), local_port));
+    // Мост датаграмм для голосовых модов. Живёт не дольше соединения:
+    // run_guest закрывает conn после serve_conn, и select-цикл моста выходит.
+    if let Some(sock) = voice_sock {
+        tokio::spawn(datagram_bridge_guest(conn.clone(), sock, last_src));
+    }
 
     // Пинг-тикер поверх контрольного канала (поддерживает связь живой).
     let ping_conn = conn.clone();
@@ -246,30 +278,30 @@ async fn serve_conn(
     result
 }
 
-/// Мост локальный UDP ↔ QUIC-датаграммы. Запоминаем адрес последнего
-/// локального отправителя (голосовой клиент), туда возвращаем ответы.
-async fn datagram_bridge_guest(conn: Connection, local_port: u16) {
-    let Ok(sock) = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, local_port)).await else {
-        tracing::warn!("UDP {local_port} занят — голосовые моды не будут работать");
-        return;
-    };
-    let sock = std::sync::Arc::new(sock);
-    let last_src = std::sync::Arc::new(tokio::sync::Mutex::new(None::<std::net::SocketAddr>));
+/// Адрес последнего локального отправителя UDP (голосового клиента) —
+/// туда возвращаем ответы хоста. Живёт всю сессию, переживая reconnect'ы.
+type LastVoiceSrc = std::sync::Arc<tokio::sync::Mutex<Option<std::net::SocketAddr>>>;
 
-    let recv_sock = sock.clone();
-    let recv_src = last_src.clone();
-    let recv_conn = conn.clone();
-    let to_local = tokio::spawn(async move {
-        while let Ok(dgram) = recv_conn.read_datagram().await {
-            if let Some(addr) = *recv_src.lock().await {
-                let _ = recv_sock.send_to(&dgram, addr).await;
-            }
-        }
-    });
-    let from_local = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match sock.recv_from(&mut buf).await {
+/// Мост локальный UDP ↔ QUIC-датаграммы. Один select-цикл вместо пары
+/// задач: выходит, как только соединение закрыто, и не оставляет сирот,
+/// которые держали бы сокет к следующему переподключению.
+async fn datagram_bridge_guest(
+    conn: Connection,
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
+    last_src: LastVoiceSrc,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        tokio::select! {
+            dgram = conn.read_datagram() => match dgram {
+                Ok(d) => {
+                    if let Some(addr) = *last_src.lock().await {
+                        let _ = sock.send_to(&d, addr).await;
+                    }
+                }
+                Err(_) => break, // соединение закрыто
+            },
+            incoming = sock.recv_from(&mut buf) => match incoming {
                 Ok((n, src)) => {
                     *last_src.lock().await = Some(src);
                     match conn.send_datagram(bytes::Bytes::copy_from_slice(&buf[..n])) {
@@ -279,11 +311,9 @@ async fn datagram_bridge_guest(conn: Connection, local_port: u16) {
                     }
                 }
                 Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
-            }
+            },
         }
-    });
-    let _ = to_local.await;
-    from_local.abort();
+    }
 }
 
 #[cfg(test)]

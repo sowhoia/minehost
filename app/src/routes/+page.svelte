@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { relaunch } from "@tauri-apps/plugin-process";
   import { check } from "@tauri-apps/plugin-updater";
 
   type Peer = { name: string; rtt_ms: number; path: string };
@@ -18,6 +19,8 @@
     | { type: "host_minecraft_status"; online: boolean };
 
   let mode = $state<"home" | "host" | "guest">("home");
+  /// Связь с хостом (в режиме гостя): жива или переустанавливается.
+  let linkState = $state<"up" | "reconnecting">("up");
   let busy = $state(false);
   let error = $state("");
   let inviteCode = $state("");
@@ -47,7 +50,13 @@
     return () => clearInterval(t);
   });
 
-  const phase = $derived(busy ? "connecting" : mode === "home" ? "idle" : "online");
+  const phase = $derived(
+    busy || (mode === "guest" && linkState === "reconnecting")
+      ? "connecting"
+      : mode === "home"
+        ? "idle"
+        : "online",
+  );
   const peerCount = $derived(Object.keys(peers).length);
   const statusColor = $derived(
     phase === "online" ? "#5fbf4f" : phase === "connecting" ? "#f3c63a" : "#d6504a",
@@ -68,7 +77,9 @@
         ? "Онлайн — хост запущен"
         : "Онлайн — ты в мире друга"
       : phase === "connecting"
-        ? "Подключение к P2P-сети…"
+        ? mode === "guest" && linkState === "reconnecting"
+          ? "Переподключение к хосту…"
+          : "Подключение к P2P-сети…"
         : "Оффлайн",
   );
   const tunnelTxt = $derived(
@@ -140,17 +151,26 @@
         delete peers[ev.id];
         break;
       case "peer_status":
-        peers[ev.id] = { name: peers[ev.id]?.name ?? "хост", rtt_ms: ev.rtt_ms, path: ev.path };
+        // У хоста только обновляем существующих: запоздавший тикер после
+        // guest_left не должен воскрешать строку-призрак.
+        if (mode === "guest") {
+          peers[ev.id] = { name: peers[ev.id]?.name ?? "хост", rtt_ms: ev.rtt_ms, path: ev.path };
+        } else if (peers[ev.id]) {
+          peers[ev.id] = { ...peers[ev.id], rtt_ms: ev.rtt_ms, path: ev.path };
+        }
         break;
       case "joined_host":
         worldName = ev.world_name;
+        linkState = "up";
         statusLine = `Подключено! Открой Minecraft → Multiplayer: «${ev.world_name}» в LAN-списке`;
         saveRecent(joinCode.trim(), ev.world_name);
         break;
       case "disconnected":
+        linkState = "reconnecting";
         statusLine = `Связь потеряна: ${ev.reason}`;
         break;
       case "reconnecting":
+        linkState = "reconnecting";
         statusLine = `Переподключение (попытка ${ev.attempt})…`;
         break;
       case "host_minecraft_status":
@@ -204,13 +224,22 @@
   let jarPath = $state("");
   let ramMb = $state("4096");
   let eula = $state(false);
-  let serverLog = $state("");
+  /// Скользящее окно лога сервера: видно контекст, а не одну последнюю строку.
+  let serverLines = $state<string[]>([]);
   let serverRunning = $state(false);
+  let logBox = $state<HTMLPreElement | null>(null);
   $effect(() => {
-    const un = listen<string>("mh-server-log", (e) => (serverLog = e.payload));
+    const un = listen<string>("mh-server-log", (e) => {
+      serverLines = [...serverLines.slice(-249), e.payload];
+    });
     return () => {
       un.then((f) => f());
     };
+  });
+  // автопрокрутка вниз при новых строках
+  $effect(() => {
+    void serverLines.length;
+    if (logBox) logBox.scrollTop = logBox.scrollHeight;
   });
   async function pickJar() {
     const p = await open({ filters: [{ name: "Server JAR", extensions: ["jar"] }] });
@@ -219,7 +248,7 @@
   async function startServerAndHost() {
     busy = true;
     error = "";
-    serverLog = "Запускаю сервер…";
+    serverLines = ["Запускаю сервер…"];
     try {
       const port = await invoke<number>("server_start", {
         jarPath,
@@ -282,6 +311,7 @@
     peers = {};
     inviteCode = "";
     statusLine = "";
+    linkState = "up";
     mode = "home";
   }
 
@@ -291,11 +321,30 @@
     setTimeout(() => (copied = false), 1500);
   }
 
-  let diagText = $state("");
+  type Diag = { peer_id: string; rtt_ms: number; path: string; addrs: string[]; self_addrs: string[] };
+  let diags = $state<Diag[]>([]);
+  let diagRaw = $state("");
+  let showRaw = $state(false);
   async function refreshDiag() {
-    diagText = JSON.stringify(await invoke("diagnostics"), null, 2);
+    try {
+      const d = await invoke<Diag | Diag[] | null>("diagnostics");
+      diagRaw = JSON.stringify(d, null, 2);
+      diags = d == null ? [] : Array.isArray(d) ? d : [d];
+    } catch {
+      /* сессия могла закрыться между тиками */
+    }
   }
+  // живая диагностика, пока открыта вкладка
+  $effect(() => {
+    if (tab !== "diag") return;
+    refreshDiag();
+    const t = setInterval(refreshDiag, 2000);
+    return () => clearInterval(t);
+  });
+  const shortId = (id: string) => (id.length > 12 ? `${id.slice(0, 12)}…` : id);
+
   let updateMsg = $state("");
+  let updateReady = $state(false);
   async function checkUpdate() {
     updateMsg = "Проверяю…";
     try {
@@ -303,7 +352,8 @@
       if (u) {
         updateMsg = `Доступна ${u.version}, скачиваю…`;
         await u.downloadAndInstall();
-        updateMsg = "Установлено — перезапусти приложение";
+        updateMsg = "Обновление установлено";
+        updateReady = true;
       } else {
         updateMsg = "У тебя последняя версия";
       }
@@ -311,7 +361,18 @@
       updateMsg = `Проверка недоступна: ${e}`;
     }
   }
+
+  /// Кик в два клика: первый «взводит», второй подтверждает.
+  let kickArm = $state<string | null>(null);
+  let kickTimer: ReturnType<typeof setTimeout> | undefined;
   async function kickPeer(id: string) {
+    if (kickArm !== id) {
+      kickArm = id;
+      clearTimeout(kickTimer);
+      kickTimer = setTimeout(() => (kickArm = null), 2500);
+      return;
+    }
+    kickArm = null;
     await invoke("kick", { id });
     delete peers[id];
   }
@@ -443,7 +504,9 @@
                     <span class="toggle-label">Принимаю Minecraft EULA</span>
                     <span class="track" class:on={eula}><span class="knob"></span></span>
                   </button>
-                  {#if serverLog}<div class="server-log">{serverLog}</div>{/if}
+                  {#if serverLines.length}
+                    <pre class="server-logbox" bind:this={logBox}>{serverLines.join("\n")}</pre>
+                  {/if}
                 {/if}
               </div>
 
@@ -689,7 +752,12 @@
                 </div>
                 <div class="ping" style:color={pv.col}>{pv.txt}</div>
                 {#if mode === "host"}
-                  <button class="kick-btn" title="Выгнать до конца сессии" onclick={() => kickPeer(id)}>КИК</button>
+                  <button
+                    class="kick-btn"
+                    class:armed={kickArm === id}
+                    title="Выгнать до конца сессии"
+                    onclick={() => kickPeer(id)}>{kickArm === id ? "ТОЧНО?" : "КИК"}</button
+                  >
                 {/if}
               </div>
             {/each}
@@ -702,16 +770,68 @@
         <div class="diag-wrap">
           <div class="label green">ДИАГНОСТИКА</div>
           <h2 class="h-px">Состояние туннеля</h2>
-          <div class="panel diag-panel">
-            <div class="diag-btns">
-              <button class="btn-px yellow" onclick={refreshDiag}>⟳ Обновить</button>
-              <button class="btn-px green" onclick={checkUpdate}>Проверить обновления</button>
+
+          {#if diags.length === 0}
+            <div class="dashed-box">
+              {mode === "home"
+                ? "— сессии нет: запусти хост или подключись к другу —"
+                : "— ждём соединения с пиром… —"}
             </div>
-            {#if updateMsg}<p class="hint-text">{updateMsg}</p>{/if}
-            <pre class="diag-pre">{diagText || "нажми «Обновить», чтобы снять показания"}</pre>
+          {:else}
+            {#each diags as d (d.peer_id)}
+              {@const pv = pingView(d.rtt_ms)}
+              <div class="panel diag-card">
+                <div class="dc-head">
+                  <span class="dc-id" title={d.peer_id}>⛓ {shortId(d.peer_id)}</span>
+                  <span
+                    class="dc-path"
+                    class:direct={d.path === "direct"}
+                    class:relay={d.path === "relay"}>{pathLabel(d.path)}</span
+                  >
+                  <span class="dc-fill"></span>
+                  <div class="sig">
+                    {#each [1, 2, 3, 4] as n (n)}
+                      <span
+                        class="bar"
+                        style:height="{4 + n * 5}px"
+                        style:background={n <= pv.level ? pv.col : "#3a3a3a"}
+                      ></span>
+                    {/each}
+                  </div>
+                  <span class="ping" style:color={pv.col}>{pv.txt}</span>
+                </div>
+                <div class="dc-sub">Адреса пира</div>
+                <div class="addr-list">
+                  {#each d.addrs as a (a)}<span class="addr">{a}</span>{:else}<span class="addr dim"
+                      >адреса ещё не согласованы</span
+                    >{/each}
+                </div>
+              </div>
+            {/each}
+            <div class="panel diag-card">
+              <div class="dc-sub">Наши адреса (что видит пир)</div>
+              <div class="addr-list">
+                {#each diags[0].self_addrs as a (a)}<span class="addr">{a}</span>{/each}
+              </div>
+            </div>
+          {/if}
+
+          <div class="diag-btns">
+            {#if updateReady}
+              <button class="btn-px yellow" onclick={() => relaunch()}>⟳ Перезапустить сейчас</button>
+            {:else}
+              <button class="btn-px green" onclick={checkUpdate}>Проверить обновления</button>
+            {/if}
+            <button class="btn-px dark" onclick={() => (showRaw = !showRaw)}>
+              {showRaw ? "− скрыть JSON" : "+ сырой JSON"}
+            </button>
           </div>
+          {#if updateMsg}<p class="hint-text">{updateMsg}</p>{/if}
+          {#if showRaw}<pre class="diag-pre">{diagRaw || "нет данных"}</pre>{/if}
+
           <p class="hint-text dim">
-            rtt и путь (напрямую / релей) помогают разобраться, почему 🌐 вместо ⚡.
+            Обновляется каждые 2 секунды. rtt и путь (напрямую / релей) помогают разобраться,
+            почему 🌐 вместо ⚡.
           </p>
         </div>
       {/if}
@@ -790,6 +910,21 @@
   }
   :global(button) {
     font-family: inherit;
+  }
+  /* клавиатурная навигация: рамка только от фокуса с клавиатуры */
+  :global(button:focus-visible),
+  :global(input:focus-visible) {
+    outline: 2px solid #7ec8ff;
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    :global(*),
+    :global(*::before),
+    :global(*::after) {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 
   .page {
@@ -1214,13 +1349,22 @@
     left: auto;
     right: 0;
   }
-  .server-log {
-    margin-top: 14px;
+  .server-logbox {
+    margin: 14px 0 0;
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: "VT323", "Courier New", monospace;
     font-size: 16px;
+    line-height: 1.25;
     color: #7d9d72;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    background: #0c0c0c;
+    border: 2px solid #000;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000;
+    padding: 10px 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 
   .host-toggle {
@@ -1628,6 +1772,11 @@
   .kick-btn:hover {
     background: #3a1a1a;
   }
+  .kick-btn.armed {
+    background: #8c2a22;
+    color: #fff;
+    animation: mh-blink 0.6s infinite;
+  }
 
   .empty-block {
     padding: 60px 20px;
@@ -1671,13 +1820,74 @@
   .diag-wrap {
     max-width: 680px;
   }
-  .diag-panel {
-    margin-top: 12px;
-  }
   .diag-btns {
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
+    margin-top: 18px;
+  }
+  .diag-card {
+    margin-top: 12px;
+  }
+  .dc-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .dc-id {
+    font-family: "Press Start 2P", monospace;
+    font-size: 10px;
+    color: #e4e4e4;
+    text-shadow: 2px 2px 0 #000;
+  }
+  .dc-path {
+    font-size: 17px;
+    padding: 2px 10px;
+    border: 2px solid #000;
+    background: #2a2a2a;
+    color: #b8b8b8;
+    box-shadow: inset 1px 1px 0 #383838;
+  }
+  .dc-path.direct {
+    background: #1d3318;
+    color: #7ec85f;
+  }
+  .dc-path.relay {
+    background: #33290f;
+    color: #f3c63a;
+  }
+  .dc-fill {
+    flex: 1 1 auto;
+  }
+  .dc-sub {
+    font-family: "Press Start 2P", monospace;
+    font-size: 8px;
+    color: #7d7d7d;
+    text-shadow: 1px 1px 0 #000;
+    letter-spacing: 1px;
+    margin: 14px 0 8px;
+  }
+  .dc-sub:first-child {
+    margin-top: 0;
+  }
+  .addr-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .addr {
+    font-size: 16px;
+    line-height: 1.2;
+    color: #7ec8ff;
+    background: #0c0c0c;
+    border: 2px solid #000;
+    box-shadow: inset 1px 1px 0 #222;
+    padding: 4px 10px;
+    word-break: break-all;
+  }
+  .addr.dim {
+    color: #5f5f5f;
   }
   .diag-pre {
     margin: 16px 0 0;
