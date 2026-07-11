@@ -22,26 +22,50 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - run: cd app && npm install
+      # Подпись macOS: APPLE_CERTIFICATE (base64 .p12) + пароль + identity
+      # убирают «приложение повреждено» → остаётся «непроверенный
+      # разработчик» (Настройки → Открыть всё равно). APPLE_ID +
+      # APPLE_PASSWORD (app-specific) + APPLE_TEAM_ID добавляют
+      # нотаризацию (нужен Developer ID из платной Apple Developer
+      # Program) — тогда никаких диалогов вовсе. Секреты прокидываем
+      # в env только НЕПУСТЫМИ: пустая APPLE_CERTIFICATE роняет
+      # codesign у tauri (так упал v1.0.1s).
+      - name: Apple signing env (только заданные секреты)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+                   APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            val="${!v}"
+            if [ -n "$val" ]; then
+              { echo "$v<<__MH_EOF__"; echo "$val"; echo "__MH_EOF__"; } >> "$GITHUB_ENV"
+            fi
+          done
+          # Не-Apple (самоподписанный) сертификат codesign «не находит»,
+          # пока цепочка не доверена — заносим его в системную связку.
+          # Для настоящего Developer ID шаг безвреден и не нужен.
+          if [ -n "$APPLE_CERTIFICATE" ]; then
+            echo "$APPLE_CERTIFICATE" | base64 -d > /tmp/mh-sign.p12
+            openssl pkcs12 -in /tmp/mh-sign.p12 \
+              -passin "pass:$APPLE_CERTIFICATE_PASSWORD" \
+              -nokeys -clcerts -out /tmp/mh-sign.pem
+            sudo security add-trusted-cert -d -r trustRoot \
+              -k /Library/Keychains/System.keychain /tmp/mh-sign.pem
+            rm /tmp/mh-sign.p12 /tmp/mh-sign.pem
+          fi
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # ключ подписи сгенерирован без пароля
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-          # Подпись macOS: убирает «приложение повреждено» → остаётся
-          # диалог «непроверенный разработчик» (Настройки → Открыть всё
-          # равно). Секреты: base64 от .p12, его пароль и имя identity
-          # из `security find-identity -v -p codesigning`.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # Нотаризация (убирает и «непроверенного разработчика», нужен
-          # платный Apple Developer Program + Developer ID-сертификат):
-          # задать три секрета ниже — tauri-action сам отправит сборку
-          # в notarytool. APPLE_PASSWORD — app-specific password Apple ID.
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
