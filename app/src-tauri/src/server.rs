@@ -109,8 +109,17 @@ pub async fn start(
         if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
             return Ok(port);
         }
-        if state.0.lock().await.is_none() {
-            return Err("сервер остановлен".into());
+        // Упавшая JVM (нет Java нужной версии, битый jar, мало RAM) не должна
+        // держать пользователя в «Запускаю…» все 10 минут.
+        let mut guard = state.0.lock().await;
+        match guard.as_mut() {
+            None => return Err("сервер остановлен".into()),
+            Some(child) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    *guard = None;
+                    return Err(format!("сервер завершился ({status}) — смотри лог"));
+                }
+            }
         }
     }
     Err("сервер не открыл порт за 10 минут — смотри лог".into())

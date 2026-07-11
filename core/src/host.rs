@@ -106,7 +106,6 @@ pub async fn start(opts: HostOptions) -> Result<HostSession> {
     let mc_status = spawn_mc_prober(port);
     let accept_task = tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
-            let ep = ep.clone();
             let world_name = world_name.clone();
             let tx = tx.clone();
             let conns = accept_conns.clone();
@@ -122,7 +121,7 @@ pub async fn start(opts: HostOptions) -> Result<HostSession> {
                     return;
                 }
                 conns.lock().await.insert(id, conn.clone());
-                handle_conn(ep, conn, port, world_name, tx, conns, mc_status).await;
+                handle_conn(conn, port, world_name, tx, conns, mc_status).await;
             });
         }
     });
@@ -154,7 +153,6 @@ fn spawn_mc_prober(port: u16) -> watch::Receiver<bool> {
 }
 
 async fn handle_conn(
-    ep: Endpoint,
     conn: Connection,
     port: u16,
     world_name: String,
@@ -162,35 +160,13 @@ async fn handle_conn(
     conns: ConnMap,
     mc_status: watch::Receiver<bool>,
 ) {
-    let remote_id = conn.remote_id();
-    let id_str = remote_id.to_string();
+    let id_str = conn.remote_id().to_string();
 
-    // Мост датаграмм для голосовых модов (Task 9 наполнит функцию).
+    // Мост датаграмм для голосовых модов.
     tokio::spawn(datagram_bridge_host(conn.clone(), port));
 
-    // Статус-тикер: rtt + путь (direct/relay).
-    {
-        let conn = conn.clone();
-        let ep = ep.clone();
-        let tx = tx.clone();
-        let id_str = id_str.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                if conn.close_reason().is_some() {
-                    break;
-                }
-                let path = net::path_kind(&ep, remote_id).await;
-                let _ = tx
-                    .send(Event::PeerStatus {
-                        id: id_str.clone(),
-                        rtt_ms: net::conn_rtt_ms(&conn),
-                        path,
-                    })
-                    .await;
-            }
-        });
-    }
+    // Статус-тикер (rtt + путь) сам завершится по закрытию соединения.
+    net::spawn_status_ticker(&conn, tx.clone());
 
     loop {
         match conn.accept_bi().await {
@@ -207,8 +183,21 @@ async fn handle_conn(
                 });
             }
             Err(_) => {
-                conns.lock().await.remove(&id_str);
-                let _ = tx.send(Event::GuestLeft { id: id_str.clone() }).await;
+                // Гость мог успеть переподключиться: запись в карте тогда уже
+                // принадлежит новому соединению. Удалять её и слать GuestLeft
+                // по смерти старого — значит «выкинуть» живого гостя из UI
+                // и потерять его для kick/diagnostics.
+                let still_ours = {
+                    let mut map = conns.lock().await;
+                    let ours = map.get(&id_str).is_some_and(|c| c.stable_id() == conn.stable_id());
+                    if ours {
+                        map.remove(&id_str);
+                    }
+                    ours
+                };
+                if still_ours {
+                    let _ = tx.send(Event::GuestLeft { id: id_str.clone() }).await;
+                }
                 break;
             }
         }
@@ -231,15 +220,7 @@ async fn handle_stream(
             let tcp = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
             // Nagle + delayed ACK добавляют до ~40-200 мс мелким игровым пакетам.
             let _ = tcp.set_nodelay(true);
-            let mut tcp = tcp;
-            let mut quic = tokio::io::join(recv, send);
-            let _ = tokio::io::copy_bidirectional_with_sizes(
-                &mut tcp,
-                &mut quic,
-                crate::COPY_BUF,
-                crate::COPY_BUF,
-            )
-            .await;
+            net::splice_tcp_quic(tcp, send, recv).await;
         }
         protocol::STREAM_CTRL => {
             // Контрольные сообщения не должны стоять в очереди за чанками.

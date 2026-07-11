@@ -126,8 +126,12 @@ async fn kick(state: State<'_, AppState>, id: String) -> Result<bool, String> {
 async fn rotate_code(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     stop_inner(&state).await;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    std::fs::remove_file(dir.join("host.key")).map_err(|e| e.to_string())?;
-    Ok(())
+    match std::fs::remove_file(dir.join("host.key")) {
+        Ok(()) => Ok(()),
+        // Ключа ещё нет — ротировать нечего, это не ошибка.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[tauri::command]

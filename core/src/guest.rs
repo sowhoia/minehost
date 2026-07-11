@@ -48,8 +48,12 @@ impl GuestSession {
     }
 }
 
+/// Пауза перед N-й попыткой переподключения: 0.5 → 1 → 2 → 4 → 8 → 15 с.
+/// Обрыв чаще всего устраним мгновенно (хост перезапустился, сеть моргнула),
+/// поэтому начинаем быстро; потолок 15 с — чтобы не спамить мёртвый адрес.
 pub fn backoff(attempt: u32) -> Duration {
-    Duration::from_secs((1u64 << attempt.min(5)).min(30))
+    let ms = 500u64 << attempt.saturating_sub(1).min(5);
+    Duration::from_millis(ms.min(15_000))
 }
 
 async fn bind_local(preferred: Option<u16>) -> Result<TcpListener> {
@@ -111,7 +115,6 @@ async fn run_guest(
                 attempt = 0;
                 *conn_slot.lock().await = Some(conn.clone());
                 let reason = serve_conn(
-                    &ep,
                     &conn,
                     &listener,
                     local_port,
@@ -135,17 +138,12 @@ async fn run_guest(
         }
         attempt += 1;
         let _ = tx.send(Event::Reconnecting { attempt }).await;
-        // Первая попытка — быстрая: обрыв чаще всего мгновенно устраним
-        // (хост перезапустился, сеть моргнула). Длинный backoff — при повторных.
-        let delay = if attempt == 1 { Duration::from_millis(500) } else { backoff(attempt) };
-        tokio::time::sleep(delay).await;
+        tokio::time::sleep(backoff(attempt)).await;
     }
 }
 
 /// Обслуживает одно соединение до его закрытия.
-#[allow(clippy::too_many_arguments)]
 async fn serve_conn(
-    ep: &Endpoint,
     conn: &Connection,
     listener: &TcpListener,
     local_port: u16,
@@ -226,46 +224,21 @@ async fn serve_conn(
         }
     });
 
-    // Статус-тикер.
-    let status_task = {
-        let conn = conn.clone();
-        let ep = ep.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let host_id = conn.remote_id();
-            let id_str = host_id.to_string();
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                if conn.close_reason().is_some() {
-                    break;
-                }
-                let path = net::path_kind(&ep, host_id).await;
-                let _ = tx
-                    .send(Event::PeerStatus {
-                        id: id_str.clone(),
-                        rtt_ms: net::conn_rtt_ms(&conn),
-                        path,
-                    })
-                    .await;
-            }
-        })
-    };
+    // Статус-тикер (rtt + путь).
+    let status_task = net::spawn_status_ticker(conn, tx.clone());
 
     // Принимаем TCP от Minecraft, пока соединение живо.
     let result = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (mut tcp, _) = accepted?;
+                let (tcp, _) = accepted?;
                 // Nagle + delayed ACK добавляют до ~40-200 мс мелким игровым пакетам.
                 let _ = tcp.set_nodelay(true);
                 let conn = conn.clone();
                 tokio::spawn(async move {
                     let Ok((mut send, recv)) = conn.open_bi().await else { return };
                     if send.write_all(&[protocol::STREAM_TCP]).await.is_err() { return; }
-                    let mut quic = tokio::io::join(recv, send);
-                    let _ = tokio::io::copy_bidirectional_with_sizes(
-                        &mut tcp, &mut quic, crate::COPY_BUF, crate::COPY_BUF,
-                    ).await;
+                    net::splice_tcp_quic(tcp, send, recv).await;
                 });
             }
             _ = conn.closed() => break Ok(()),
@@ -323,8 +296,9 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_caps() {
-        assert_eq!(backoff(1), Duration::from_secs(2));
-        assert_eq!(backoff(2), Duration::from_secs(4));
-        assert_eq!(backoff(10), Duration::from_secs(30));
+        assert_eq!(backoff(1), Duration::from_millis(500));
+        assert_eq!(backoff(2), Duration::from_secs(1));
+        assert_eq!(backoff(5), Duration::from_secs(8));
+        assert_eq!(backoff(10), Duration::from_secs(15));
     }
 }

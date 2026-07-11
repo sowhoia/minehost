@@ -18,6 +18,10 @@
     | { type: "reconnecting"; attempt: number }
     | { type: "host_minecraft_status"; online: boolean };
 
+  /// Настройки, которые обидно вводить заново при каждом запуске.
+  const stored = (k: string, fallback: string) =>
+    typeof localStorage === "undefined" ? fallback : (localStorage.getItem(k) ?? fallback);
+
   let mode = $state<"home" | "host" | "guest">("home");
   /// Связь с хостом (в режиме гостя): жива или переустанавливается.
   let linkState = $state<"up" | "reconnecting">("up");
@@ -25,15 +29,22 @@
   let error = $state("");
   let inviteCode = $state("");
   let joinCode = $state("");
-  let playerName = $state("Player");
+  let playerName = $state(stored("mh-name", "Player"));
   let statusLine = $state("");
   let worldName = $state("");
+  /// Локальный порт туннеля у гостя — запасной вход через Direct Connect.
+  let localPort = $state(0);
   let copied = $state(false);
   let peers = $state<Record<string, Peer>>({});
+  /// История rtt по пирам (тик статуса — раз в 2 с) для спарклайна.
+  let rttHist = $state<Record<string, number[]>>({});
 
   type Tab = "host" | "join" | "players" | "diag";
   let tab = $state<Tab>("host");
-  let hostSource = $state<"lan" | "port" | "jar">("lan");
+  const storedSrc = stored("mh-src", "lan");
+  let hostSource = $state<"lan" | "port" | "jar">(
+    storedSrc === "port" || storedSrc === "jar" ? storedSrc : "lan",
+  );
   let elapsed = $state(0);
   let appVersion = $state("");
 
@@ -149,6 +160,7 @@
         break;
       case "guest_left":
         delete peers[ev.id];
+        delete rttHist[ev.id];
         break;
       case "peer_status":
         // У хоста только обновляем существующих: запоздавший тикер после
@@ -157,10 +169,14 @@
           peers[ev.id] = { name: peers[ev.id]?.name ?? "хост", rtt_ms: ev.rtt_ms, path: ev.path };
         } else if (peers[ev.id]) {
           peers[ev.id] = { ...peers[ev.id], rtt_ms: ev.rtt_ms, path: ev.path };
+        } else {
+          break;
         }
+        rttHist[ev.id] = [...(rttHist[ev.id] ?? []).slice(-59), ev.rtt_ms];
         break;
       case "joined_host":
         worldName = ev.world_name;
+        localPort = ev.local_port;
         linkState = "up";
         statusLine = `Подключено! Открой Minecraft → Multiplayer: «${ev.world_name}» в LAN-списке`;
         saveRecent(joinCode.trim(), ev.world_name);
@@ -205,25 +221,42 @@
 
   const inviteLink = $derived(inviteCode ? `minehost://join/${inviteCode}` : "");
 
-  let manualPort = $state("");
+  let manualPort = $state(stored("mh-port", ""));
   const portValid = (s: string) => /^\d+$/.test(s) && +s > 0 && +s < 65536;
 
-  async function startHost(port?: number) {
+  /// Порт, с которым хост стартовал в этот раз: ротация кода перезапускает
+  /// хост с тем же портом, а не уходит в LAN-поиск (который для port/jar
+  /// просто упадёт по таймауту).
+  let lastHostPort: number | null = null;
+
+  async function startHost(port?: number): Promise<boolean> {
     busy = true;
     error = "";
     try {
       inviteCode = await invoke<string>("start_host", { manualPort: port ?? null });
+      lastHostPort = port ?? null;
       mode = "host";
+      return true;
     } catch (e) {
       error = String(e);
+      return false;
     } finally {
       busy = false;
     }
   }
 
-  let jarPath = $state("");
-  let ramMb = $state("4096");
+  let jarPath = $state(stored("mh-jar", ""));
+  let ramMb = $state(stored("mh-ram", "4096"));
   let eula = $state(false);
+
+  // Персистим настройки: эффект перезапускается при изменении любой из них.
+  $effect(() => {
+    localStorage.setItem("mh-name", playerName);
+    localStorage.setItem("mh-src", hostSource);
+    localStorage.setItem("mh-port", manualPort);
+    localStorage.setItem("mh-jar", jarPath);
+    localStorage.setItem("mh-ram", ramMb);
+  });
   /// Скользящее окно лога сервера: видно контекст, а не одну последнюю строку.
   let serverLines = $state<string[]>([]);
   let serverRunning = $state(false);
@@ -256,7 +289,12 @@
         acceptEula: eula,
       });
       serverRunning = true;
-      await startHost(port);
+      // startHost ловит свои ошибки сам — но java-сироту после неудачи
+      // оставлять нельзя: иначе повторный запуск упрётся в «уже запущен».
+      if (!(await startHost(port))) {
+        await invoke("server_stop");
+        serverRunning = false;
+      }
     } catch (e) {
       error = String(e);
       await invoke("server_stop");
@@ -293,6 +331,7 @@
     error = "";
     try {
       const port = await invoke<number>("join", { code: joinCode.trim(), playerName });
+      localPort = port;
       statusLine = `Туннель готов (127.0.0.1:${port}), устанавливаем связь…`;
       mode = "guest";
     } catch (e) {
@@ -309,8 +348,11 @@
       serverRunning = false;
     }
     peers = {};
+    rttHist = {};
     inviteCode = "";
     statusLine = "";
+    localPort = 0;
+    lastHostPort = null;
     linkState = "up";
     mode = "home";
   }
@@ -321,14 +363,24 @@
     setTimeout(() => (copied = false), 1500);
   }
 
-  type Diag = { peer_id: string; rtt_ms: number; path: string; addrs: string[]; self_addrs: string[] };
+  type DiagPath = { addr: string; relay: boolean; selected: boolean; rtt_ms: number };
+  type Diag = {
+    peer_id: string;
+    rtt_ms: number;
+    path: string;
+    paths: DiagPath[];
+    addrs: string[];
+    self_addrs: string[];
+  };
   let diags = $state<Diag[]>([]);
-  let diagRaw = $state("");
+  let diagData = $state<Diag | Diag[] | null>(null);
   let showRaw = $state(false);
+  // Строку JSON считаем только когда блок реально открыт.
+  const diagRaw = $derived(showRaw ? JSON.stringify(diagData, null, 2) : "");
   async function refreshDiag() {
     try {
       const d = await invoke<Diag | Diag[] | null>("diagnostics");
-      diagRaw = JSON.stringify(d, null, 2);
+      diagData = d;
       diags = d == null ? [] : Array.isArray(d) ? d : [d];
     } catch {
       /* сессия могла закрыться между тиками */
@@ -345,6 +397,8 @@
 
   let updateMsg = $state("");
   let updateReady = $state(false);
+  /// Версия, найденная тихой проверкой при старте (бейдж на вкладке).
+  let updateAvail = $state("");
   async function checkUpdate() {
     updateMsg = "Проверяю…";
     try {
@@ -354,6 +408,7 @@
         await u.downloadAndInstall();
         updateMsg = "Обновление установлено";
         updateReady = true;
+        updateAvail = "";
       } else {
         updateMsg = "У тебя последняя версия";
       }
@@ -361,6 +416,17 @@
       updateMsg = `Проверка недоступна: ${e}`;
     }
   }
+  // Тихая проверка при старте: не качаем ничего сами, только показываем бейдж.
+  $effect(() => {
+    check()
+      .then((u) => {
+        if (u) {
+          updateAvail = u.version;
+          updateMsg = `Доступна версия ${u.version}`;
+        }
+      })
+      .catch(() => {});
+  });
 
   /// Кик в два клика: первый «взводит», второй подтверждает.
   let kickArm = $state<string | null>(null);
@@ -379,10 +445,13 @@
   async function rotateCode() {
     busy = true;
     error = "";
+    const port = lastHostPort;
     try {
       await invoke("rotate_code");
       peers = {};
-      await startHost();
+      rttHist = {};
+      // Тот же источник, что и был: для port/jar LAN-поиск не нужен и упал бы.
+      await startHost(port ?? undefined);
     } catch (e) {
       error = String(e);
       mode = "home";
@@ -391,6 +460,50 @@
     }
   }
 </script>
+
+{#snippet sigBars(pv: { level: number; col: string })}
+  <div class="sig">
+    {#each [1, 2, 3, 4] as n (n)}
+      <span
+        class="bar"
+        style:height="{4 + n * 5}px"
+        style:background={n <= pv.level ? pv.col : "#3a3a3a"}
+      ></span>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet playerRow(id: string, p: Peer)}
+  {@const sk = skinFor(p.name)}
+  {@const pv = pingView(p.rtt_ms)}
+  <div class="player-row joined">
+    <div class="p-head" style:background={sk.skin}>
+      <span class="ph-hair" style:background={sk.hair}></span>
+      <span class="ph-eye l"></span>
+      <span class="ph-pupil l" style:box-shadow="inset -3px 0 0 {sk.eye}"></span>
+      <span class="ph-eye r"></span>
+      <span class="ph-pupil r" style:box-shadow="inset 3px 0 0 {sk.eye}"></span>
+      <span class="ph-mouth"></span>
+    </div>
+    <div class="p-info">
+      <div class="p-name">{p.name}</div>
+      <div class="p-status">
+        <span class="p-dot"></span>
+        <span>{mode === "guest" ? "хост" : "подключён"} · {pathLabel(p.path)}</span>
+      </div>
+    </div>
+    {@render sigBars(pv)}
+    <div class="ping" style:color={pv.col}>{pv.txt}</div>
+    {#if mode === "host"}
+      <button
+        class="kick-btn"
+        class:armed={kickArm === id}
+        title="Выгнать до конца сессии"
+        onclick={() => kickPeer(id)}>{kickArm === id ? "ТОЧНО?" : "КИК"}</button
+      >
+    {/if}
+  </div>
+{/snippet}
 
 <div class="page">
   <div class="shell">
@@ -432,6 +545,7 @@
       </button>
       <button class="nav-btn" class:active={tab === "diag"} onclick={() => (tab = "diag")}>
         Диагностика
+        {#if updateAvail && !updateReady}<span class="upd-dot" title="Доступно обновление"></span>{/if}
         <span class="nav-bar"></span>
       </button>
     </nav>
@@ -589,37 +703,15 @@
             <div class="label green">ТЕКУЩЕЕ ПОДКЛЮЧЕНИЕ</div>
             <h2 class="h-px">{worldName || "Мир друга"}</h2>
             {#if statusLine}<p class="hint-text">{statusLine}</p>{/if}
+            {#if localPort}
+              <p class="hint-text dim">
+                Если мира нет в LAN-списке: Multiplayer → Direct Connect →
+                <span class="inline-addr">127.0.0.1:{localPort}</span>
+              </p>
+            {/if}
             <div class="players-list">
               {#each Object.entries(peers) as [id, p] (id)}
-                {@const sk = skinFor(p.name)}
-                {@const pv = pingView(p.rtt_ms)}
-                <div class="player-row">
-                  <div class="p-head" style:background={sk.skin}>
-                    <span class="ph-hair" style:background={sk.hair}></span>
-                    <span class="ph-eye l"></span>
-                    <span class="ph-pupil l" style:box-shadow="inset -3px 0 0 {sk.eye}"></span>
-                    <span class="ph-eye r"></span>
-                    <span class="ph-pupil r" style:box-shadow="inset 3px 0 0 {sk.eye}"></span>
-                    <span class="ph-mouth"></span>
-                  </div>
-                  <div class="p-info">
-                    <div class="p-name">{p.name}</div>
-                    <div class="p-status">
-                      <span class="p-dot"></span>
-                      <span>хост · {pathLabel(p.path)}</span>
-                    </div>
-                  </div>
-                  <div class="sig">
-                    {#each [1, 2, 3, 4] as n (n)}
-                      <span
-                        class="bar"
-                        style:height="{4 + n * 5}px"
-                        style:background={n <= pv.level ? pv.col : "#3a3a3a"}
-                      ></span>
-                    {/each}
-                  </div>
-                  <div class="ping" style:color={pv.col}>{pv.txt}</div>
-                </div>
+                {@render playerRow(id, p)}
               {/each}
             </div>
             <button class="btn-px red wide" onclick={stopSession}>■ Отключиться</button>
@@ -642,6 +734,9 @@
                   placeholder="mh:… или minehost://join/…"
                   bind:value={joinCode}
                   disabled={busy}
+                  onkeydown={(e) => {
+                    if (e.key === "Enter" && !busy && joinCode.trim()) joinHost();
+                  }}
                 />
               </div>
             </div>
@@ -723,43 +818,7 @@
         {:else}
           <div class="players-list">
             {#each Object.entries(peers) as [id, p] (id)}
-              {@const sk = skinFor(p.name)}
-              {@const pv = pingView(p.rtt_ms)}
-              <div class="player-row joined">
-                <div class="p-head" style:background={sk.skin}>
-                  <span class="ph-hair" style:background={sk.hair}></span>
-                  <span class="ph-eye l"></span>
-                  <span class="ph-pupil l" style:box-shadow="inset -3px 0 0 {sk.eye}"></span>
-                  <span class="ph-eye r"></span>
-                  <span class="ph-pupil r" style:box-shadow="inset 3px 0 0 {sk.eye}"></span>
-                  <span class="ph-mouth"></span>
-                </div>
-                <div class="p-info">
-                  <div class="p-name">{p.name}</div>
-                  <div class="p-status">
-                    <span class="p-dot"></span>
-                    <span>{mode === "guest" ? "хост" : "подключён"} · {pathLabel(p.path)}</span>
-                  </div>
-                </div>
-                <div class="sig">
-                  {#each [1, 2, 3, 4] as n (n)}
-                    <span
-                      class="bar"
-                      style:height="{4 + n * 5}px"
-                      style:background={n <= pv.level ? pv.col : "#3a3a3a"}
-                    ></span>
-                  {/each}
-                </div>
-                <div class="ping" style:color={pv.col}>{pv.txt}</div>
-                {#if mode === "host"}
-                  <button
-                    class="kick-btn"
-                    class:armed={kickArm === id}
-                    title="Выгнать до конца сессии"
-                    onclick={() => kickPeer(id)}>{kickArm === id ? "ТОЧНО?" : "КИК"}</button
-                  >
-                {/if}
-              </div>
+              {@render playerRow(id, p)}
             {/each}
           </div>
         {/if}
@@ -789,23 +848,37 @@
                     class:relay={d.path === "relay"}>{pathLabel(d.path)}</span
                   >
                   <span class="dc-fill"></span>
-                  <div class="sig">
-                    {#each [1, 2, 3, 4] as n (n)}
+                  {@render sigBars(pv)}
+                  <span class="ping" style:color={pv.col}>{pv.txt}</span>
+                </div>
+                <div class="dc-sub">Пути к пиру</div>
+                <div class="addr-list">
+                  {#each d.paths as p (p.addr)}
+                    <div class="path-row" class:sel={p.selected}>
+                      <span class="path-tag" class:relay={p.relay}>{p.relay ? "🌐 релей" : "⚡ прямой"}</span>
+                      <span class="path-addr">{p.addr}</span>
+                      {#if p.selected}<span class="path-sel">▶ трафик здесь</span>{/if}
+                      <span class="path-rtt">{p.rtt_ms ? `${p.rtt_ms} ms` : "…"}</span>
+                    </div>
+                  {:else}
+                    {#each d.addrs as a (a)}<span class="addr">{a}</span>{:else}<span class="addr dim"
+                        >пути ещё не открыты</span
+                      >{/each}
+                  {/each}
+                </div>
+                {#if (rttHist[d.peer_id] ?? []).length > 1}
+                  <div class="dc-sub">Пинг за последние ~2 минуты</div>
+                  <div class="spark">
+                    {#each rttHist[d.peer_id] ?? [] as v, i (i)}
                       <span
-                        class="bar"
-                        style:height="{4 + n * 5}px"
-                        style:background={n <= pv.level ? pv.col : "#3a3a3a"}
+                        class="spark-bar"
+                        title="{v} ms"
+                        style:height="{Math.max(6, Math.min(100, (v / 250) * 100))}%"
+                        style:background={!v ? "#3a3a3a" : v < 110 ? "#5fbf4f" : v < 185 ? "#f3c63a" : "#d6504a"}
                       ></span>
                     {/each}
                   </div>
-                  <span class="ping" style:color={pv.col}>{pv.txt}</span>
-                </div>
-                <div class="dc-sub">Адреса пира</div>
-                <div class="addr-list">
-                  {#each d.addrs as a (a)}<span class="addr">{a}</span>{:else}<span class="addr dim"
-                      >адреса ещё не согласованы</span
-                    >{/each}
-                </div>
+                {/if}
               </div>
             {/each}
             <div class="panel diag-card">
@@ -819,6 +892,8 @@
           <div class="diag-btns">
             {#if updateReady}
               <button class="btn-px yellow" onclick={() => relaunch()}>⟳ Перезапустить сейчас</button>
+            {:else if updateAvail}
+              <button class="btn-px yellow" onclick={checkUpdate}>⬇ Установить {updateAvail}</button>
             {:else}
               <button class="btn-px green" onclick={checkUpdate}>Проверить обновления</button>
             {/if}
@@ -1071,6 +1146,16 @@
   }
   .badge.on {
     background: #3f8a30;
+  }
+  .upd-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-left: 7px;
+    background: #f3c63a;
+    border: 1px solid #000;
+    box-shadow: 0 0 6px rgba(243, 198, 58, 0.6);
+    animation: mh-blink 1.2s infinite;
   }
 
   /* ===== content ===== */
@@ -1888,6 +1973,73 @@
   }
   .addr.dim {
     color: #5f5f5f;
+  }
+  .inline-addr {
+    color: #7ec8ff;
+    user-select: all;
+  }
+  .path-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 16px;
+    line-height: 1.2;
+    background: #0c0c0c;
+    border: 2px solid #000;
+    box-shadow: inset 1px 1px 0 #222;
+    padding: 5px 10px;
+  }
+  .path-row.sel {
+    border-color: #2f5a26;
+    box-shadow:
+      inset 1px 1px 0 #1d3318,
+      0 0 0 1px #2f5a26;
+  }
+  .path-tag {
+    flex: 0 0 auto;
+    padding: 1px 8px;
+    border: 2px solid #000;
+    background: #1d3318;
+    color: #7ec85f;
+    box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  .path-tag.relay {
+    background: #33290f;
+    color: #f3c63a;
+  }
+  .path-addr {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: #7ec8ff;
+    word-break: break-all;
+  }
+  .path-sel {
+    flex: 0 0 auto;
+    color: #7ec85f;
+    font-size: 15px;
+  }
+  .path-rtt {
+    flex: 0 0 auto;
+    color: #d6d6d6;
+    font-size: 17px;
+  }
+  .spark {
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 46px;
+    padding: 6px 8px;
+    background: #0c0c0c;
+    border: 2px solid #000;
+    box-shadow:
+      inset 2px 2px 0 #222,
+      inset -2px -2px 0 #000;
+  }
+  .spark-bar {
+    flex: 1 1 auto;
+    max-width: 9px;
+    min-width: 2px;
+    image-rendering: pixelated;
   }
   .diag-pre {
     margin: 16px 0 0;
