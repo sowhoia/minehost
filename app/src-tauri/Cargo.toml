@@ -1,6 +1,6 @@
 [package]
 name = "mine-host-app"
-version = "1.0.1"
+version = "1.1.0"
 description = "MineHost — P2P-туннель для игры с друзьями в Minecraft"
 authors = ["mine-host"]
 edition = "2021"

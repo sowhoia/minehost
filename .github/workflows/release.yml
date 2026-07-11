@@ -28,13 +28,20 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           # ключ подписи сгенерирован без пароля
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-          # Подпись macOS (Developer ID Application): убирает «приложение
-          # повреждено» → остаётся мягкое «непроверенный разработчик» с
-          # кнопкой «Открыть». Нотаризация сознательно не настроена
-          # (для неё понадобились бы APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID).
+          # Подпись macOS: убирает «приложение повреждено» → остаётся
+          # диалог «непроверенный разработчик» (Настройки → Открыть всё
+          # равно). Секреты: base64 от .p12, его пароль и имя identity
+          # из `security find-identity -v -p codesigning`.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Нотаризация (убирает и «непроверенного разработчика», нужен
+          # платный Apple Developer Program + Developer ID-сертификат):
+          # задать три секрета ниже — tauri-action сам отправит сборку
+          # в notarytool. APPLE_PASSWORD — app-specific password Apple ID.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: app
           tagName: ${{ github.ref_name }}
